@@ -1,4 +1,4 @@
-name: RSS Pushcut Notifier
+name: RSS Slack Notifier
 
 on:
   schedule:
@@ -9,10 +9,10 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Send Pushcut for New RSS Items
+      - name: Send RSS to Slack
         run: |
           FEEDS=(
-            "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
+            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
           )
 
           mkdir -p .cache
@@ -27,7 +27,7 @@ jobs:
             XML=$(curl -s "$FEED_URL")
             [ -z "$XML" ] && echo "Empty feed: $FEED_URL" && continue
 
-            LINK=$(echo "$XML" | grep -oPm1 "(?<=<link>)[^<]+")
+            LINK=$(echo "$XML" | grep -oPm1 "(?<=<link>)[^<]+" | head -n 1)
             TITLE=$(echo "$XML" | grep -oPm1 "(?<=<title>)[^<]+" | sed -n 2p)
 
             [ -z "$LINK" ] && echo "No <link> found, skipping" && continue
@@ -43,10 +43,9 @@ jobs:
 
             echo "$LINK" > "$LAST_FILE"
 
-            echo "Sending notification for: $TITLE"
+            echo "Sending to Slack: $TITLE"
 
-            curl -X POST https://api.pushcut.io/v1/notifications/RSS%20Update \
-              -H "API-Key: ${{ secrets.PUSHCUT_API_KEY }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"text\":\"$TITLE\",\"detail\":\"$LINK\"}"
+            curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+              -H 'Content-type: application/json' \
+              --data "{\"text\":\"📰 *${TITLE}*\n${LINK}\"}"
           done
