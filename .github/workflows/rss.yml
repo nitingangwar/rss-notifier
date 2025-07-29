@@ -9,10 +9,18 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Send RSS to Slack
+      - name: Install XML tools
+        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+
+      - name: Send RSS updates to Slack
         run: |
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
+            "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
+            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0U="
+            "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
+            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0E="
+            "https://www.globenewswire.com/atomFeed/search/contract/exchange/Nasdaq,NYSE"
           )
 
           mkdir -p .cache
@@ -22,35 +30,28 @@ jobs:
             FEED_ID="feed_$INDEX"
             LAST_FILE=".cache/${FEED_ID}.last"
 
-            echo "Checking $FEED_URL"
+            echo "🔍 Checking: $FEED_URL"
 
             XML=$(curl -s "$FEED_URL")
-            [ -z "$XML" ] && echo "Empty feed: $FEED_URL" && continue
+            [ -z "$XML" ] && echo "❌ Empty feed or failed to fetch $FEED_URL" && continue
 
-            XML=$(curl -s "$FEED_URL")
-            [ -z "$XML" ] && echo "Empty feed: $FEED_URL" && continue
-            
-            LINK=$(echo "$XML" | xmllint --xpath "string(//item[1]/link)" - 2>/dev/null)
-            TITLE=$(echo "$XML" | xmllint --xpath "string(//item[1]/title)" - 2>/dev/null)
-            
+            LINK=$(echo "$XML" | xmllint --xpath "string(//item[1]/link | //entry[1]/link/@href)" - 2>/dev/null)
+            TITLE=$(echo "$XML" | xmllint --xpath "string(//item[1]/title | //entry[1]/title)" - 2>/dev/null)
+
+            [ -z "$LINK" ] && echo "❌ No <link> found, skipping $FEED_URL" && continue
             [ -z "$TITLE" ] && TITLE="(No Title)"
-            [ -z "$LINK" ] && echo "No link found, skipping..." && continue
-
-
-            [ -z "$LINK" ] && echo "No <link> found, skipping" && continue
-            [ -z "$TITLE" ] && TITLE="(no title)"
 
             if [ -f "$LAST_FILE" ]; then
               LAST_LINK=$(cat "$LAST_FILE")
               if [ "$LAST_LINK" = "$LINK" ]; then
-                echo "No new item for $FEED_URL"
+                echo "✅ No new post for $FEED_URL"
                 continue
               fi
             fi
 
             echo "$LINK" > "$LAST_FILE"
 
-            echo "Sending to Slack: $TITLE"
+            echo "📣 Sending to Slack: $TITLE"
 
             curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
               -H 'Content-type: application/json' \
