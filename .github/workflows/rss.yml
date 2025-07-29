@@ -24,24 +24,21 @@ jobs:
           )
 
           mkdir -p .cache
-
           declare -A BLOCKS
           declare -A WEBHOOKS
-
+          
           WEBHOOKS[general]="${{ secrets.SLACK_WEBHOOK_GENERAL }}"
           WEBHOOKS[medical]="${{ secrets.SLACK_WEBHOOK_MEDICAL }}"
           WEBHOOKS[contracts]="${{ secrets.SLACK_WEBHOOK_CONTRACTS }}"
-
-          BLOCKS[general]=""
-          BLOCKS[medical]=""
-          BLOCKS[contracts]=""
-
+          
+          BLOCKS[general]="[]"
+          BLOCKS[medical]="[]"
+          BLOCKS[contracts]="[]"
+          
           for INDEX in "${!FEEDS[@]}"; do
             FEED_URL="${FEEDS[$INDEX]}"
             FEED_ID="feed_$INDEX"
-            LAST_FILE=".cache/${FEED_ID}.last"
-
-            # Determine category by feed index
+          
             if [[ $INDEX -le 1 ]]; then
               CATEGORY="general"
             elif [[ $INDEX -le 3 ]]; then
@@ -49,54 +46,54 @@ jobs:
             else
               CATEGORY="contracts"
             fi
-
-            echo "🔍 Checking ($CATEGORY): $FEED_URL"
-
+          
+            echo "Checking ($CATEGORY): $FEED_URL"
             XML=$(curl -s "$FEED_URL")
-            [ -z "$XML" ] && echo "❌ Empty feed or failed to fetch $FEED_URL" && continue
-
+          
             for i in 1 2 3; do
               LINK=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href)" - 2>/dev/null)
               TITLE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/title)" - 2>/dev/null)
               DESCRIPTION=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/description | //entry[$i]/summary)" - 2>/dev/null)
               PUBDATE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/pubDate | //entry[$i]/updated)" - 2>/dev/null)
-
+          
               [ -z "$LINK" ] && continue
               [ -z "$TITLE" ] && TITLE="(No Title)"
               [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
               [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
-
+          
               HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
               HASH_FILE=".cache/${FEED_ID}_$HASH"
               if [ -f "$HASH_FILE" ]; then
                 continue
               fi
               touch "$HASH_FILE"
-
-              BLOCK="{
-                \"type\": \"section\",
-                \"text\": {
-                  \"type\": \"mrkdwn\",
-                  \"text\": \"*📰 ${TITLE}*\n📄 ${DESCRIPTION}\n🔗 <${LINK}|Read more>\n🕒 ${PUBDATE}\"
-                }
-              },
-              {
-                \"type\": \"divider\"
-              }"
-
-              BLOCKS[$CATEGORY]="${BLOCKS[$CATEGORY]}${BLOCK}"
+          
+              BLOCKS[$CATEGORY]=$(jq \
+                --arg title "$TITLE" \
+                --arg desc "$DESCRIPTION" \
+                --arg link "$LINK" \
+                --arg date "$PUBDATE" \
+                '. + [
+                  {
+                    type: "section",
+                    text: { type: "mrkdwn", text: "*📰 \($title)*\n📄 \($desc)\n🔗 <\($link)|Read more>\n🕒 \($date)" }
+                  },
+                  {
+                    type: "divider"
+                  }
+                ]' <<< "${BLOCKS[$CATEGORY]}")
             done
           done
-
+          
           for CATEGORY in general medical contracts; do
-            PAYLOAD=$(echo "${BLOCKS[$CATEGORY]}" | sed 's/,\s*$//')
-
-            if [ -n "$PAYLOAD" ]; then
-              echo "📤 Sending $CATEGORY news to Slack..."
+            if [ "$(jq length <<< "${BLOCKS[$CATEGORY]}")" -gt 0 ]; then
+              echo "Sending $CATEGORY updates to Slack..."
               curl -X POST "${WEBHOOKS[$CATEGORY]}" \
                 -H 'Content-type: application/json' \
-                --data "{\"blocks\": [${PAYLOAD}]}"
+                --data "{\"blocks\": ${BLOCKS[$CATEGORY]}}"
             else
-              echo "✅ No new articles for $CATEGORY"
+              echo "No new posts for $CATEGORY"
             fi
           done
+
+          
