@@ -20,10 +20,12 @@ jobs:
             "https://www.globenewswire.com/atomFeed/search/contract/exchange/Nasdaq,NYSE"
           )
 
-          for INDEX in ${!FEEDS[@]}; do
+          mkdir -p .cache
+
+          for INDEX in "${!FEEDS[@]}"; do
             FEED_URL="${FEEDS[$INDEX]}"
             FEED_ID="feed_$INDEX"
-            LAST_GUID_FILE=".$FEED_ID.guid"
+            LAST_GUID_FILE=".cache/${FEED_ID}.guid"
 
             echo "Checking $FEED_URL"
 
@@ -47,7 +49,10 @@ jobs:
             TITLE=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<title>)[^<]+" | head -n 2 | tail -n 1)
             LINK=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<link>)[^<]+" | tail -n 1)
 
+            echo "Sending notification: $TITLE"
+
             curl -X POST https://api.pushcut.io/v1/notifications/RSS%20Update \
               -H "API-Key: ${{ secrets.PUSHCUT_API_KEY }}" \
               -H "Content-Type: application/json" \
               -d "{\"text\":\"$TITLE\",\"detail\":\"$LINK\"}"
+          done
