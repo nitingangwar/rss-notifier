@@ -12,11 +12,7 @@ jobs:
       - name: Notify for 4 RSS Feeds
         run: |
           FEEDS=(
-            "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
-            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0U="
             "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
-            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0E="
-            "https://www.globenewswire.com/atomFeed/search/contract/exchange/Nasdaq,NYSE"
           )
 
           mkdir -p .cache
