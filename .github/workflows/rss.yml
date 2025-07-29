@@ -1,4 +1,4 @@
-name: RSS Slack Notifier
+name: RSS Category Notifier
 
 on:
   schedule:
@@ -12,54 +12,91 @@ jobs:
       - name: Install XML tools
         run: sudo apt-get update && sudo apt-get install -y libxml2-utils
 
-      - name: Send RSS updates to Slack
+      - name: Process and Send Feeds to Slack Channels
         run: |
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0U="
             "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
+            "https://www.globenewswire.com/rssfeed/search/contract/exchange/Nasdaq,NYSE"
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0E="
-            "https://www.globenewswire.com/atomFeed/search/contract/exchange/Nasdaq,NYSE"
           )
 
           mkdir -p .cache
+
+          declare -A BLOCKS
+          declare -A WEBHOOKS
+
+          WEBHOOKS[general]="${{ secrets.SLACK_WEBHOOK_GENERAL }}"
+          WEBHOOKS[medical]="${{ secrets.SLACK_WEBHOOK_MEDICAL }}"
+          WEBHOOKS[contracts]="${{ secrets.SLACK_WEBHOOK_CONTRACTS }}"
+
+          BLOCKS[general]=""
+          BLOCKS[medical]=""
+          BLOCKS[contracts]=""
 
           for INDEX in "${!FEEDS[@]}"; do
             FEED_URL="${FEEDS[$INDEX]}"
             FEED_ID="feed_$INDEX"
             LAST_FILE=".cache/${FEED_ID}.last"
 
-            echo "🔍 Checking: $FEED_URL"
+            # Determine category by feed index
+            if [[ $INDEX -le 1 ]]; then
+              CATEGORY="general"
+            elif [[ $INDEX -le 3 ]]; then
+              CATEGORY="medical"
+            else
+              CATEGORY="contracts"
+            fi
+
+            echo "🔍 Checking ($CATEGORY): $FEED_URL"
 
             XML=$(curl -s "$FEED_URL")
             [ -z "$XML" ] && echo "❌ Empty feed or failed to fetch $FEED_URL" && continue
 
-            LINK=$(echo "$XML" | xmllint --xpath "string(//item[1]/link | //entry[1]/link/@href)" - 2>/dev/null)
-            TITLE=$(echo "$XML" | xmllint --xpath "string(//item[1]/title | //entry[1]/title)" - 2>/dev/null)
-            DESCRIPTION=$(echo "$XML" | xmllint --xpath "string(//item[1]/description | //entry[1]/summary)" - 2>/dev/null)
-            PUBDATE=$(echo "$XML" | xmllint --xpath "string(//item[1]/pubDate | //entry[1]/updated)" - 2>/dev/null)
+            for i in 1 2 3; do
+              LINK=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href)" - 2>/dev/null)
+              TITLE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/title)" - 2>/dev/null)
+              DESCRIPTION=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/description | //entry[$i]/summary)" - 2>/dev/null)
+              PUBDATE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/pubDate | //entry[$i]/updated)" - 2>/dev/null)
 
-            [ -z "$TITLE" ] && TITLE="(No Title)"
-            [ -z "$LINK" ] && echo "❌ No link found, skipping..." && continue
-            [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
-            [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
+              [ -z "$LINK" ] && continue
+              [ -z "$TITLE" ] && TITLE="(No Title)"
+              [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
+              [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
 
-            if [ -f "$LAST_FILE" ]; then
-              LAST_LINK=$(cat "$LAST_FILE")
-              if [ "$LAST_LINK" = "$LINK" ]; then
-                echo "✅ No new post for $FEED_URL"
+              HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
+              HASH_FILE=".cache/${FEED_ID}_$HASH"
+              if [ -f "$HASH_FILE" ]; then
                 continue
               fi
-            fi
+              touch "$HASH_FILE"
 
-            echo "$LINK" > "$LAST_FILE"
-
-            echo "📣 Sending to Slack: $TITLE"
-
-            curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
-              -H 'Content-type: application/json' \
-              --data "{
-                \"text\": \"📰 *${TITLE}*\n\n📄 ${DESCRIPTION}\n\n🔗 ${LINK}\n🕒 ${PUBDATE}\"
+              BLOCK="{
+                \"type\": \"section\",
+                \"text\": {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"*📰 ${TITLE}*\n📄 ${DESCRIPTION}\n🔗 <${LINK}|Read more>\n🕒 ${PUBDATE}\"
+                }
+              },
+              {
+                \"type\": \"divider\"
               }"
+
+              BLOCKS[$CATEGORY]="${BLOCKS[$CATEGORY]}${BLOCK}"
+            done
+          done
+
+          for CATEGORY in general medical contracts; do
+            PAYLOAD=$(echo "${BLOCKS[$CATEGORY]}" | sed 's/,\s*$//')
+
+            if [ -n "$PAYLOAD" ]; then
+              echo "📤 Sending $CATEGORY news to Slack..."
+              curl -X POST "${WEBHOOKS[$CATEGORY]}" \
+                -H 'Content-type: application/json' \
+                --data "{\"blocks\": [${PAYLOAD}]}"
+            else
+              echo "✅ No new articles for $CATEGORY"
+            fi
           done
