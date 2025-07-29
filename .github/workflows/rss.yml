@@ -1,0 +1,53 @@
+name: Multi-RSS Notifier
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"  # Every 10 minutes
+  workflow_dispatch:
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify for 4 RSS Feeds
+        run: |
+          FEEDS=(
+            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
+            "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
+            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0U="
+            "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
+            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0E="
+            "https://www.globenewswire.com/atomFeed/search/contract/exchange/Nasdaq,NYSE"
+          )
+
+          for INDEX in ${!FEEDS[@]}; do
+            FEED_URL="${FEEDS[$INDEX]}"
+            FEED_ID="feed_$INDEX"
+            LAST_GUID_FILE=".$FEED_ID.guid"
+
+            echo "Checking $FEED_URL"
+
+            GUID=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<guid>)[^<]+")
+
+            if [ -z "$GUID" ]; then
+              echo "No GUID found. Skipping $FEED_URL"
+              continue
+            fi
+
+            if [ -f "$LAST_GUID_FILE" ]; then
+              LAST_GUID=$(cat "$LAST_GUID_FILE")
+              if [ "$LAST_GUID" = "$GUID" ]; then
+                echo "No new post for $FEED_URL"
+                continue
+              fi
+            fi
+
+            echo "$GUID" > "$LAST_GUID_FILE"
+
+            TITLE=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<title>)[^<]+" | head -n 2 | tail -n 1)
+            LINK=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<link>)[^<]+" | tail -n 1)
+
+            curl -X POST https://api.pushcut.io/v1/notifications/RSS%20Update \
+              -H "API-Key: ${{ secrets.PUSHCUT_API_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"text\":\"$TITLE\",\"detail\":\"$LINK\"}"
