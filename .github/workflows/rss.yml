@@ -1,15 +1,15 @@
-name: Multi-RSS Notifier
+name: RSS Pushcut Notifier
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # Every 10 minutes
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Notify for 4 RSS Feeds
+      - name: Send Pushcut for New RSS Items
         run: |
           FEEDS=(
             "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
@@ -20,31 +20,30 @@ jobs:
           for INDEX in "${!FEEDS[@]}"; do
             FEED_URL="${FEEDS[$INDEX]}"
             FEED_ID="feed_$INDEX"
-            LAST_GUID_FILE=".cache/${FEED_ID}.guid"
+            LAST_FILE=".cache/${FEED_ID}.last"
 
             echo "Checking $FEED_URL"
 
-            GUID=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<guid>)[^<]+")
+            XML=$(curl -s "$FEED_URL")
+            [ -z "$XML" ] && echo "Empty feed: $FEED_URL" && continue
 
-            if [ -z "$GUID" ]; then
-              echo "No GUID found. Skipping $FEED_URL"
-              continue
-            fi
+            LINK=$(echo "$XML" | grep -oPm1 "(?<=<link>)[^<]+")
+            TITLE=$(echo "$XML" | grep -oPm1 "(?<=<title>)[^<]+" | sed -n 2p)
 
-            if [ -f "$LAST_GUID_FILE" ]; then
-              LAST_GUID=$(cat "$LAST_GUID_FILE")
-              if [ "$LAST_GUID" = "$GUID" ]; then
-                echo "No new post for $FEED_URL"
+            [ -z "$LINK" ] && echo "No <link> found, skipping" && continue
+            [ -z "$TITLE" ] && TITLE="(no title)"
+
+            if [ -f "$LAST_FILE" ]; then
+              LAST_LINK=$(cat "$LAST_FILE")
+              if [ "$LAST_LINK" = "$LINK" ]; then
+                echo "No new item for $FEED_URL"
                 continue
               fi
             fi
 
-            echo "$GUID" > "$LAST_GUID_FILE"
+            echo "$LINK" > "$LAST_FILE"
 
-            TITLE=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<title>)[^<]+" | head -n 2 | tail -n 1)
-            LINK=$(curl -s "$FEED_URL" | grep -oPm1 "(?<=<link>)[^<]+" | tail -n 1)
-
-            echo "Sending notification: $TITLE"
+            echo "Sending notification for: $TITLE"
 
             curl -X POST https://api.pushcut.io/v1/notifications/RSS%20Update \
               -H "API-Key: ${{ secrets.PUSHCUT_API_KEY }}" \
