@@ -9,8 +9,10 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Install XML tools
-        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxml2-utils w3m jq
 
       - name: Process and Send Feeds to Slack Channels
         run: |
@@ -19,26 +21,27 @@ jobs:
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0U="
             "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
-            "https://www.globenewswire.com/rssfeed/search/contract/exchange/Nasdaq,NYSE"
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0E="
+            "https://www.globenewswire.com/atomFeed/search/contract/exchange/Nasdaq,NYSE"
           )
 
           mkdir -p .cache
+
           declare -A BLOCKS
           declare -A WEBHOOKS
-          
+
           WEBHOOKS[general]="${{ secrets.SLACK_WEBHOOK_GENERAL }}"
           WEBHOOKS[medical]="${{ secrets.SLACK_WEBHOOK_MEDICAL }}"
           WEBHOOKS[contracts]="${{ secrets.SLACK_WEBHOOK_CONTRACTS }}"
-          
+
           BLOCKS[general]="[]"
           BLOCKS[medical]="[]"
           BLOCKS[contracts]="[]"
-          
+
           for INDEX in "${!FEEDS[@]}"; do
             FEED_URL="${FEEDS[$INDEX]}"
             FEED_ID="feed_$INDEX"
-          
+
             if [[ $INDEX -le 1 ]]; then
               CATEGORY="general"
             elif [[ $INDEX -le 3 ]]; then
@@ -46,28 +49,31 @@ jobs:
             else
               CATEGORY="contracts"
             fi
-          
-            echo "Checking ($CATEGORY): $FEED_URL"
+
+            echo "🔍 Checking ($CATEGORY): $FEED_URL"
             XML=$(curl -s "$FEED_URL")
-          
+
             for i in 1 2 3; do
               LINK=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href)" - 2>/dev/null)
               TITLE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/title)" - 2>/dev/null)
               DESCRIPTION=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/description | //entry[$i]/summary)" - 2>/dev/null)
               PUBDATE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/pubDate | //entry[$i]/updated)" - 2>/dev/null)
-          
+
               [ -z "$LINK" ] && continue
               [ -z "$TITLE" ] && TITLE="(No Title)"
               [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
               [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
-          
+
+              # Clean HTML
+              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | head -c 300)
+
               HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
               HASH_FILE=".cache/${FEED_ID}_$HASH"
               if [ -f "$HASH_FILE" ]; then
                 continue
               fi
               touch "$HASH_FILE"
-          
+
               BLOCKS[$CATEGORY]=$(jq \
                 --arg title "$TITLE" \
                 --arg desc "$DESCRIPTION" \
@@ -84,16 +90,14 @@ jobs:
                 ]' <<< "${BLOCKS[$CATEGORY]}")
             done
           done
-          
+
           for CATEGORY in general medical contracts; do
             if [ "$(jq length <<< "${BLOCKS[$CATEGORY]}")" -gt 0 ]; then
-              echo "Sending $CATEGORY updates to Slack..."
+              echo "📤 Sending $CATEGORY news to Slack..."
               curl -X POST "${WEBHOOKS[$CATEGORY]}" \
                 -H 'Content-type: application/json' \
                 --data "{\"blocks\": ${BLOCKS[$CATEGORY]}}"
             else
-              echo "No new posts for $CATEGORY"
+              echo "✅ No new posts for $CATEGORY"
             fi
           done
-
-          
