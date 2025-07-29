@@ -27,8 +27,8 @@ jobs:
             XML=$(curl -s "$FEED_URL")
             [ -z "$XML" ] && echo "Empty feed: $FEED_URL" && continue
 
-            LINK=$(echo "$XML" | grep -oPm1 "(?<=<link>)[^<]+" | head -n 1)
-            TITLE=$(echo "$XML" | grep -oPm1 "(?<=<title>)[^<]+" | sed -n 2p)
+            LINK=$(echo "$XML" | xmllint --xpath "string(//item[1]/link)" - 2>/dev/null)
+            TITLE=$(echo "$XML" | xmllint --xpath "string(//item[1]/title)" - 2>/dev/null)
 
             [ -z "$LINK" ] && echo "No <link> found, skipping" && continue
             [ -z "$TITLE" ] && TITLE="(no title)"
