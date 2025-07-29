@@ -1,8 +1,8 @@
-name: RSS Category Notifier
+name: Categorized RSS Alerts
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"  # Every 10 minutes
   workflow_dispatch:
 
 jobs:
@@ -14,15 +14,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq
 
-      - name: Process and Send Feeds to Slack Channels
+      - name: Parse RSS Feeds and Post to Slack
         run: |
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
-            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0U="
-            "https://www.globenewswire.com/rssfeed/search/Positive%252520Topline/exchange/Nasdaq,NYSE"
-            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUVV5TE0E="
-            "https://www.globenewswire.com/atomFeed/search/contract/exchange/Nasdaq,NYSE"
           )
 
           mkdir -p .cache
@@ -38,60 +34,66 @@ jobs:
           BLOCKS[medical]="[]"
           BLOCKS[contracts]="[]"
 
-          for INDEX in "${!FEEDS[@]}"; do
-            for INDEX in 0 1; do
-              FEED_URL="${FEEDS[$INDEX]}"
-              FEED_ID="feed_$INDEX"
-            
-              echo "🔍 Checking: $FEED_URL"
-              XML=$(curl -s "$FEED_URL")
-            
-              for i in 1 2 3; do
-                LINK=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href)" - 2>/dev/null)
-                TITLE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/title)" - 2>/dev/null)
-                DESCRIPTION=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/description | //entry[$i]/summary)" - 2>/dev/null)
-                PUBDATE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/pubDate | //entry[$i]/updated)" - 2>/dev/null)
-            
-                [ -z "$LINK" ] && continue
-                [ -z "$TITLE" ] && TITLE="(No Title)"
-                [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
-                [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
-            
-                # Clean HTML
-                DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | head -c 300)
-            
-                CONTENT="$TITLE $DESCRIPTION"
-                CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
-            
-                # Detect category
-                if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
-                  CATEGORY="medical"
-                elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
-                  CATEGORY="contracts"
-                else
-                  CATEGORY="general"
-                fi
-            
-                HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
-                HASH_FILE=".cache/${FEED_ID}_$HASH"
-                if [ -f "$HASH_FILE" ]; then
-                  continue
-                fi
-                touch "$HASH_FILE"
-            
-                BLOCKS[$CATEGORY]=$(jq \
-                  --arg title "$TITLE" \
-                  --arg desc "$DESCRIPTION" \
-                  --arg link "$LINK" \
-                  --arg date "$PUBDATE" \
-                  '. + [
-                    {
-                      type: "section",
-                      text: { type: "mrkdwn", text: "*📰 \($title)*\n📄 \($desc)\n🔗 <\($link)|Read more>\n🕒 \($date)" }
-                    },
-                    {
-                      type: "divider"
-                    }
-                  ]' <<< "${BLOCKS[$CATEGORY]}")
-              done
+          for INDEX in 0 1; do
+            FEED_URL="${FEEDS[$INDEX]}"
+            FEED_ID="feed_$INDEX"
+            echo "🔍 Checking Feed: $FEED_URL"
+            XML=$(curl -s "$FEED_URL")
+
+            for i in 1 2 3; do
+              LINK=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href)" - 2>/dev/null)
+              TITLE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/title)" - 2>/dev/null)
+              DESCRIPTION=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/description | //entry[$i]/summary)" - 2>/dev/null)
+              PUBDATE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/pubDate | //entry[$i]/updated)" - 2>/dev/null)
+
+              [ -z "$LINK" ] && continue
+              [ -z "$TITLE" ] && TITLE="(No Title)"
+              [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
+              [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
+
+              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | head -c 300)
+              CONTENT="$TITLE $DESCRIPTION"
+              CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
+
+              if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
+                CATEGORY="medical"
+              elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
+                CATEGORY="contracts"
+              else
+                CATEGORY="general"
+              fi
+
+              HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
+              HASH_FILE=".cache/${FEED_ID}_$HASH"
+              if [ -f "$HASH_FILE" ]; then
+                continue
+              fi
+              touch "$HASH_FILE"
+
+              BLOCKS[$CATEGORY]=$(jq \
+                --arg title "$TITLE" \
+                --arg desc "$DESCRIPTION" \
+                --arg link "$LINK" \
+                --arg date "$PUBDATE" \
+                '. + [
+                  {
+                    type: "section",
+                    text: { type: "mrkdwn", text: "*📰 \($title)*\n📄 \($desc)\n🔗 <\($link)|Read more>\n🕒 \($date)" }
+                  },
+                  {
+                    type: "divider"
+                  }
+                ]' <<< "${BLOCKS[$CATEGORY]}")
             done
+          done
+
+          for CATEGORY in general medical contracts; do
+            if [ "$(jq length <<< "${BLOCKS[$CATEGORY]}")" -gt 0 ]; then
+              echo "📤 Sending $CATEGORY news to Slack..."
+              curl -X POST "${WEBHOOKS[$CATEGORY]}" \
+                -H 'Content-type: application/json' \
+                --data "{\"blocks\": ${BLOCKS[$CATEGORY]}}"
+            else
+              echo "✅ No new posts for $CATEGORY"
+            fi
+          done
