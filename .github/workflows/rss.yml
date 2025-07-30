@@ -2,17 +2,28 @@ name: Categorized RSS Alerts
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # Every 10 minutes
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
   notify:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Install tools
+      - name: Set up environment
         run: |
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq
+
+      - name: Download previous hashes (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: rss-cache
+          path: .cache
+        continue-on-error: true
+
+      - name: Create cache file if not exists
+        run: mkdir -p .cache && touch .cache/sent_hashes.txt
 
       - name: Parse RSS Feeds and Post to Slack
         run: |
@@ -20,8 +31,6 @@ jobs:
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
           )
-
-          mkdir -p .cache
 
           declare -A BLOCKS
           declare -A WEBHOOKS
@@ -36,7 +45,6 @@ jobs:
 
           for INDEX in 0 1; do
             FEED_URL="${FEEDS[$INDEX]}"
-            FEED_ID="feed_$INDEX"
             echo "🔍 Checking Feed: $FEED_URL"
             XML=$(curl -s "$FEED_URL")
 
@@ -64,11 +72,12 @@ jobs:
               fi
 
               HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
-              HASH_FILE=".cache/${FEED_ID}_$HASH"
-              if [ -f "$HASH_FILE" ]; then
+
+              if grep -q "$HASH" .cache/sent_hashes.txt; then
                 continue
               fi
-              touch "$HASH_FILE"
+
+              echo "$HASH" >> .cache/sent_hashes.txt
 
               BLOCKS[$CATEGORY]=$(jq \
                 --arg title "$TITLE" \
@@ -97,3 +106,9 @@ jobs:
               echo "✅ No new posts for $CATEGORY"
             fi
           done
+
+      - name: Upload updated hashes
+        uses: actions/upload-artifact@v4
+        with:
+          name: rss-cache
+          path: .cache/sent_hashes.txt
