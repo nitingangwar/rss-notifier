@@ -1,8 +1,8 @@
-name: Categorized RSS Alerts
+name: Categorized RSS Alerts with Sentiment
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -45,6 +45,7 @@ jobs:
 
           for INDEX in 0 1; do
             FEED_URL="${FEEDS[$INDEX]}"
+            FEED_ID="feed_$INDEX"
             echo "🔍 Checking Feed: $FEED_URL"
             XML=$(curl -s "$FEED_URL")
 
@@ -63,6 +64,7 @@ jobs:
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
+              # 🔎 Determine Category
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
                 CATEGORY="medical"
               elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
@@ -71,27 +73,38 @@ jobs:
                 CATEGORY="general"
               fi
 
-              HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
+              # 🔎 Determine Sentiment
+              if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|partnership|launch|topline"; then
+                SENTIMENT="🟢 [POSITIVE]"
+              elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
+                SENTIMENT="🔴 [NEGATIVE]"
+              else
+                SENTIMENT="⚪ [NEUTRAL]"
+              fi
 
+              # 🔒 Deduplication
+              HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
               if grep -q "$HASH" .cache/sent_hashes.txt; then
                 continue
               fi
-
               echo "$HASH" >> .cache/sent_hashes.txt
 
+              # 📦 Add to Slack Block
               BLOCKS[$CATEGORY]=$(jq \
                 --arg title "$TITLE" \
+                --arg sentiment "$SENTIMENT" \
                 --arg desc "$DESCRIPTION" \
                 --arg link "$LINK" \
                 --arg date "$PUBDATE" \
                 '. + [
                   {
                     type: "section",
-                    text: { type: "mrkdwn", text: "*📰 \($title)*\n📄 \($desc)\n🔗 <\($link)|Read more>\n🕒 \($date)" }
+                    text: {
+                      type: "mrkdwn",
+                      text: "*\($sentiment)* *\($title)*\n📄 \($desc)\n🔗 <\($link)|Read more>\n🕒 \($date)"
+                    }
                   },
-                  {
-                    type: "divider"
-                  }
+                  { type: "divider" }
                 ]' <<< "${BLOCKS[$CATEGORY]}")
             done
           done
