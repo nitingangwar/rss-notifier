@@ -2,7 +2,7 @@ name: Categorized RSS Alerts with Sentiment
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -45,7 +45,6 @@ jobs:
 
           for INDEX in 0 1; do
             FEED_URL="${FEEDS[$INDEX]}"
-            FEED_ID="feed_$INDEX"
             echo "🔍 Checking Feed: $FEED_URL"
             XML=$(curl -s "$FEED_URL")
 
@@ -73,8 +72,8 @@ jobs:
                 CATEGORY="general"
               fi
 
-              # 🔎 Determine Sentiment
-              if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|partnership|launch|topline"; then
+              # 🔎 Improved Sentiment Detection
+              if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT="🟢 [POSITIVE]"
               elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
                 SENTIMENT="🔴 [NEGATIVE]"
