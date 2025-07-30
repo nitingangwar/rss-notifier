@@ -2,7 +2,7 @@ name: Categorized RSS Alerts with Sentiment
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/1 * * * *"
   workflow_dispatch:
 
 jobs:
