@@ -1,7 +1,7 @@
 name: Categorized RSS Alerts with Stock Recommendation
 
 on:
-  workflow_dispatch: # Trigger manually via GitHub
+  workflow_dispatch:  # Trigger manually via GitHub
   schedule:
     - cron: "*/5 * * * *"  # Trigger every 5 minutes (can adjust as needed)
 
@@ -24,14 +24,23 @@ jobs:
           path: .cache
         continue-on-error: true  # Continue if artifact is not found
 
-      # Step 3: Create cache file if not exists (for storing article hashes)
+      # Step 3: Check if the file exists before uploading
+      - name: Verify the existence of the file
+        run: |
+          if [ -f .cache/sent_hashes.txt ]; then
+            echo "File exists, proceeding with upload."
+          else
+            echo "File does not exist, skipping upload."
+          fi
+
+      # Step 4: Create cache file if not exists (for storing article hashes)
       - name: Create cache file if not exists
         run: |
           mkdir -p .cache
           touch .cache/sent_hashes.txt
           touch .cache/last_5min_articles.txt
 
-      # Step 4: Parse RSS Feeds, perform sentiment analysis, and send to Slack
+      # Step 5: Parse RSS Feeds, perform sentiment analysis, and send to Slack
       - name: Parse RSS Feeds and Post to Slack
         run: |
           FEEDS=(
@@ -112,9 +121,9 @@ jobs:
             done
           done
 
-      # Step 5: Upload updated hashes
+      # Step 6: Upload updated hashes
       - name: Upload updated hashes
         uses: actions/upload-artifact@v4
         with:
-          name: rss-cache
-          path: .cache/sent_hashes.txt
+          name: rss-cache  # Ensure correct artifact name
+          path: .cache/sent_hashes.txt  # Path to upload
