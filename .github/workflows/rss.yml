@@ -1,8 +1,6 @@
 name: Categorized RSS Alerts with Sentiment
 
 on:
-  schedule:
-    - cron: "*/1 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -15,12 +13,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq
 
-      - name: Download previous hashes (if any)
-        uses: actions/download-artifact@v4
+      - name: Restore deduplication cache
+        uses: actions/cache@v3
         with:
-          name: rss-cache
           path: .cache
-        continue-on-error: true
+          key: rss-hash-cache
+          restore-keys: rss-hash-cache
 
       - name: Create cache file if not exists
         run: mkdir -p .cache && touch .cache/sent_hashes.txt
@@ -72,7 +70,7 @@ jobs:
                 CATEGORY="general"
               fi
 
-              # 🔎 Improved Sentiment Detection
+              # 🔎 Sentiment Detection
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT="🟢 [POSITIVE]"
               elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
@@ -118,9 +116,3 @@ jobs:
               echo "✅ No new posts for $CATEGORY"
             fi
           done
-
-      - name: Upload updated hashes
-        uses: actions/upload-artifact@v4
-        with:
-          name: rss-cache
-          path: .cache/sent_hashes.txt
