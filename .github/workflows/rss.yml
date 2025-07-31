@@ -79,13 +79,9 @@ jobs:
               fi
               echo "$HASH" >> .cache/sent_hashes.txt
 
-              # 🧱 Format Slack Message
-              TEXT=":bell: *New Article:*
-$SENTIMENT *$TITLE*
-:page_facing_up: $DESCRIPTION
-:link: <$LINK|Read more>
-:clock3: *Posted:* $PUBDATE
-───────────────"
+              # 🧱 Format Slack Message with real line breaks using jq-safe formatting
+              TEXT=$(printf ":bell: *New Article:*\n%s *%s*\n:page_facing_up: %s\n:link: <%s|Read more>\n:clock3: *Posted:* %s\n───────────────" \
+                "$SENTIMENT" "$TITLE" "$DESCRIPTION" "$LINK" "$PUBDATE")
 
               PAYLOAD=$(jq -n --arg text "$TEXT" \
                 '{blocks: [ { type: "section", text: { type: "mrkdwn", text: $text } } ]}')
