@@ -13,33 +13,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq
 
-      - name: Restore deduplication cache
-        uses: actions/cache@v3
+      - name: Download previous hashes (if any)
+        uses: actions/download-artifact@v4
         with:
+          name: rss-cache
           path: .cache
-          key: rss-hash-cache
-          restore-keys: rss-hash-cache
+        continue-on-error: true
 
       - name: Create cache file if not exists
         run: mkdir -p .cache && touch .cache/sent_hashes.txt
 
-      - name: Parse RSS Feeds and Post to Slack
+      - name: Parse RSS Feeds and Send Individually
         run: |
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
           )
 
-          declare -A BLOCKS
           declare -A WEBHOOKS
-
           WEBHOOKS[general]="${{ secrets.SLACK_WEBHOOK_GENERAL }}"
           WEBHOOKS[medical]="${{ secrets.SLACK_WEBHOOK_MEDICAL }}"
           WEBHOOKS[contracts]="${{ secrets.SLACK_WEBHOOK_CONTRACTS }}"
-
-          BLOCKS[general]="[]"
-          BLOCKS[medical]="[]"
-          BLOCKS[contracts]="[]"
 
           for INDEX in 0 1; do
             FEED_URL="${FEEDS[$INDEX]}"
@@ -86,33 +80,20 @@ jobs:
               fi
               echo "$HASH" >> .cache/sent_hashes.txt
 
-              # 📦 Add to Slack Block
-              BLOCKS[$CATEGORY]=$(jq \
-                --arg title "$TITLE" \
-                --arg sentiment "$SENTIMENT" \
-                --arg desc "$DESCRIPTION" \
-                --arg link "$LINK" \
-                --arg date "$PUBDATE" \
-                '. + [
-                  {
-                    type: "section",
-                    text: {
-                      type: "mrkdwn",
-                      text: "*\($sentiment)* *\($title)*\n📄 \($desc)\n🔗 <\($link)|Read more>\n🕒 \($date)"
-                    }
-                  },
-                  { type: "divider" }
-                ]' <<< "${BLOCKS[$CATEGORY]}")
+              # 📤 Send to Slack Individually
+              PAYLOAD=$(jq -n \
+                --arg text "🔔 *New Article:*\n*$SENTIMENT* *$TITLE*\n📄 $DESCRIPTION\n🔗 <$LINK|Read more>\n🕒 *Posted:* $PUBDATE\n───────────────" \
+                '{blocks: [ { type: "section", text: { type: "mrkdwn", text: $text } } ]}')
+
+              echo "📤 Sending article to $CATEGORY channel..."
+              curl -X POST "${WEBHOOKS[$CATEGORY]}" \
+                -H 'Content-type: application/json' \
+                --data "$PAYLOAD"
             done
           done
 
-          for CATEGORY in general medical contracts; do
-            if [ "$(jq length <<< "${BLOCKS[$CATEGORY]}")" -gt 0 ]; then
-              echo "📤 Sending $CATEGORY news to Slack..."
-              curl -X POST "${WEBHOOKS[$CATEGORY]}" \
-                -H 'Content-type: application/json' \
-                --data "{\"blocks\": ${BLOCKS[$CATEGORY]}}"
-            else
-              echo "✅ No new posts for $CATEGORY"
-            fi
-          done
+      - name: Upload updated hashes
+        uses: actions/upload-artifact@v4
+        with:
+          name: rss-cache
+          path: .cache/sent_hashes.txt
