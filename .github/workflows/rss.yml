@@ -1,28 +1,47 @@
 name: Categorized RSS Alerts with Sentiment
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Trigger manually via GitHub
+  schedule:
+    - cron: "*/5 * * * *"  # Trigger every 5 minutes (can adjust as needed)
 
 jobs:
   notify:
     runs-on: ubuntu-latest
 
     steps:
+      # Step 1: Set up the environment
       - name: Set up environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxml2-utils w3m jq
+          sudo apt-get install -y libxml2-utils w3m jq curl
 
+      # Step 2: Download previous hashes (if any) from the previous run
       - name: Download previous hashes (if any)
         uses: actions/download-artifact@v4
         with:
           name: rss-cache
           path: .cache
-        continue-on-error: true
+        continue-on-error: true  # Continue if artifact is not found
 
+      # Step 3: Check if the file exists before uploading
+      - name: Verify the existence of the file before upload
+        run: |
+          echo "Checking for .cache/sent_hashes.txt"
+          if [ -f .cache/sent_hashes.txt ]; then
+            echo "File exists, proceeding with upload."
+          else
+            echo "File does not exist, skipping upload."
+          fi
+
+      # Step 4: Create cache file if not exists (for storing article hashes)
       - name: Create cache file if not exists
-        run: mkdir -p .cache && touch .cache/sent_hashes.txt && touch .cache/last_5min_articles.txt
+        run: |
+          mkdir -p .cache
+          touch .cache/sent_hashes.txt
+          touch .cache/last_5min_articles.txt
 
+      # Step 5: Parse RSS Feeds, perform sentiment analysis, and send to Slack
       - name: Parse RSS Feeds and Post to Slack
         run: |
           FEEDS=(
@@ -60,19 +79,19 @@ jobs:
 
               # Get the timestamp of the article's pubDate and convert to Unix timestamp
               ARTICLE_TIME=$(date -d "$PUBDATE" +%s)
-
-              # Skip the article if it's older than 5 minutes
               if [ $ARTICLE_TIME -lt $FIVE_MINUTES_AGO ]; then
                 echo "Skipping article: $TITLE (older than 5 minutes)"
                 continue
               fi
 
-              # Check if the headline is already in the list of last 5 minutes' articles
               HEADLINE_HASH=$(echo "$TITLE" | md5sum | cut -d ' ' -f 1)
               if grep -q "$HEADLINE_HASH" .cache/last_5min_articles.txt; then
                 echo "Skipping duplicate article: $TITLE"
                 continue
               fi
+
+              HEADLINE_HASH=$(echo "$TITLE" | md5sum | cut -d ' ' -f 1)
+              echo "$HEADLINE_HASH" >> .cache/last_5min_articles.txt
 
               # 🔎 Categorize the article
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
@@ -86,10 +105,13 @@ jobs:
               # 😊 Sentiment Detection
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT=":large_green_circle: [POSITIVE]"
+                RECOMMENDATION="BUY"
               elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
                 SENTIMENT=":red_circle: [NEGATIVE]"
+                RECOMMENDATION="SELL"
               else
                 SENTIMENT=":white_circle: [NEUTRAL]"
+                RECOMMENDATION="HOLD"
               fi
 
               # 🔐 Deduplication check: Skip if already sent within the last 5 minutes
@@ -116,8 +138,9 @@ jobs:
             done
           done
 
+      # Step 6: Upload updated hashes
       - name: Upload updated hashes
         uses: actions/upload-artifact@v4
         with:
-          name: rss-cache
-          path: .cache/sent_hashes.txt
+          name: rss-cache  # Ensure correct artifact name
+          path: .cache/sent_hashes.txt  # Path to upload
