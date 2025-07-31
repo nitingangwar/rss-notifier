@@ -23,7 +23,7 @@ jobs:
       - name: Create cache file if not exists
         run: mkdir -p .cache && touch .cache/sent_hashes.txt
 
-      - name: Parse RSS Feeds and Send Individually
+      - name: Parse RSS Feeds and Post to Slack
         run: |
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
@@ -35,8 +35,7 @@ jobs:
           WEBHOOKS[medical]="${{ secrets.SLACK_WEBHOOK_MEDICAL }}"
           WEBHOOKS[contracts]="${{ secrets.SLACK_WEBHOOK_CONTRACTS }}"
 
-          for INDEX in 0 1; do
-            FEED_URL="${FEEDS[$INDEX]}"
+          for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
             XML=$(curl -s "$FEED_URL")
 
@@ -55,7 +54,7 @@ jobs:
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
-              # 🔎 Determine Category
+              # 🔎 Category Detection
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
                 CATEGORY="medical"
               elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
@@ -66,11 +65,11 @@ jobs:
 
               # 🔎 Sentiment Detection
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
-                SENTIMENT="🟢 [POSITIVE]"
+                SENTIMENT=":large_green_circle: [POSITIVE]"
               elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
-                SENTIMENT="🔴 [NEGATIVE]"
+                SENTIMENT=":red_circle: [NEGATIVE]"
               else
-                SENTIMENT="⚪ [NEUTRAL]"
+                SENTIMENT=":white_circle: [NEUTRAL]"
               fi
 
               # 🔒 Deduplication
@@ -80,12 +79,18 @@ jobs:
               fi
               echo "$HASH" >> .cache/sent_hashes.txt
 
-              # 📤 Send to Slack Individually
-              PAYLOAD=$(jq -n \
-                --arg text "🔔 *New Article:*\n*$SENTIMENT* *$TITLE*\n📄 $DESCRIPTION\n🔗 <$LINK|Read more>\n🕒 *Posted:* $PUBDATE\n───────────────" \
+              # 🎯 Format message with real line breaks
+              TEXT=":bell: *New Article:*
+$SENTIMENT *$TITLE*
+:page_facing_up: $DESCRIPTION
+:link: <$LINK|Read more>
+:clock3: *Posted:* $PUBDATE
+───────────────"
+
+              PAYLOAD=$(jq -n --arg text "$TEXT" \
                 '{blocks: [ { type: "section", text: { type: "mrkdwn", text: $text } } ]}')
 
-              echo "📤 Sending article to $CATEGORY channel..."
+              echo "📤 Sending to Slack ($CATEGORY)..."
               curl -X POST "${WEBHOOKS[$CATEGORY]}" \
                 -H 'Content-type: application/json' \
                 --data "$PAYLOAD"
