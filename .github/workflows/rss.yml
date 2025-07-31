@@ -21,7 +21,7 @@ jobs:
         continue-on-error: true
 
       - name: Create cache file if not exists
-        run: mkdir -p .cache && touch .cache/sent_hashes.txt
+        run: mkdir -p .cache && touch .cache/sent_hashes.txt && touch .cache/last_5min_articles.txt
 
       - name: Parse RSS Feeds and Post to Slack
         run: |
@@ -34,6 +34,10 @@ jobs:
           WEBHOOKS[general]="${{ secrets.SLACK_WEBHOOK_GENERAL }}"
           WEBHOOKS[medical]="${{ secrets.SLACK_WEBHOOK_MEDICAL }}"
           WEBHOOKS[contracts]="${{ secrets.SLACK_WEBHOOK_CONTRACTS }}"
+
+          # Get the current time and calculate the cutoff time for the last 5 minutes
+          CURRENT_TIME=$(date +%s)
+          FIVE_MINUTES_AGO=$(($CURRENT_TIME - 300))  # Subtract 300 seconds (5 minutes)
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
@@ -54,7 +58,23 @@ jobs:
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
-              # 🔎 Categorize
+              # Get the timestamp of the article's pubDate and convert to Unix timestamp
+              ARTICLE_TIME=$(date -d "$PUBDATE" +%s)
+
+              # Skip the article if it's older than 5 minutes
+              if [ $ARTICLE_TIME -lt $FIVE_MINUTES_AGO ]; then
+                echo "Skipping article: $TITLE (older than 5 minutes)"
+                continue
+              fi
+
+              # Check if the headline is already in the list of last 5 minutes' articles
+              HEADLINE_HASH=$(echo "$TITLE" | md5sum | cut -d ' ' -f 1)
+              if grep -q "$HEADLINE_HASH" .cache/last_5min_articles.txt; then
+                echo "Skipping duplicate article: $TITLE"
+                continue
+              fi
+
+              # 🔎 Categorize the article
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
                 CATEGORY="medical"
               elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
@@ -63,7 +83,7 @@ jobs:
                 CATEGORY="general"
               fi
 
-              # 😊 Sentiment
+              # 😊 Sentiment Detection
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT=":large_green_circle: [POSITIVE]"
               elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
@@ -72,14 +92,17 @@ jobs:
                 SENTIMENT=":white_circle: [NEUTRAL]"
               fi
 
-              # 🔐 Deduplication
+              # 🔐 Deduplication check: Skip if already sent within the last 5 minutes
               HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
               if grep -q "$HASH" .cache/sent_hashes.txt; then
                 continue
               fi
               echo "$HASH" >> .cache/sent_hashes.txt
 
-              # 🧱 Format Slack Message with real line breaks using jq-safe formatting
+              # Add the headline to the list of last 5 minutes' articles
+              echo "$HEADLINE_HASH" >> .cache/last_5min_articles.txt
+
+              # 🧱 Format Slack message with real line breaks
               TEXT=$(printf ":bell: *New Article:*\n%s *%s*\n:page_facing_up: %s\n:link: <%s|Read more>\n:clock3: *Posted:* %s\n───────────────" \
                 "$SENTIMENT" "$TITLE" "$DESCRIPTION" "$LINK" "$PUBDATE")
 
