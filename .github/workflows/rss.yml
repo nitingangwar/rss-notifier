@@ -4,6 +4,8 @@ on:
   # Comment or remove this to avoid triggering by GitHub's own cron schedule
   # schedule:
   #   - cron: "*/10 * * * *"  # This is GitHub's internal cron schedule (comment out)
+  workflow_dispatch:  # Trigger manually or by external system like cron-job.org
+
 jobs:
   notify:
     runs-on: ubuntu-latest
