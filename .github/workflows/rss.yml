@@ -3,7 +3,7 @@ name: Categorized RSS Alerts with Sentiment
 on:
   workflow_dispatch:  # Trigger manually via GitHub
   schedule:
-    - cron: "*/5 * * * *"  # Trigger every 5 minutes (can adjust as needed)
+    - cron: "*/10 * * * *"  # Trigger every 10 minutes (can adjust as needed)
 
 jobs:
   notify:
@@ -39,7 +39,7 @@ jobs:
         run: |
           mkdir -p .cache
           touch .cache/sent_hashes.txt
-          touch .cache/last_5min_articles.txt
+          touch .cache/last_10min_articles.txt
 
       # Step 5: Parse RSS Feeds, perform sentiment analysis, and send to Slack
       - name: Parse RSS Feeds and Post to Slack
@@ -54,9 +54,9 @@ jobs:
           WEBHOOKS[medical]="${{ secrets.SLACK_WEBHOOK_MEDICAL }}"
           WEBHOOKS[contracts]="${{ secrets.SLACK_WEBHOOK_CONTRACTS }}"
 
-          # Get the current time and calculate the cutoff time for the last 5 minutes
+          # Get the current time and calculate the cutoff time for the last 10 minutes
           CURRENT_TIME=$(date +%s)
-          FIVE_MINUTES_AGO=$(($CURRENT_TIME - 600))  # Subtract 300 seconds (5 minutes)
+          TEN_MINUTES_AGO=$(($CURRENT_TIME - 600))  # Subtract 600 seconds (10 minutes)
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
@@ -73,25 +73,25 @@ jobs:
               [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
               [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
 
-              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | head -c 600)
+              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | head -c 300)
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
               # Get the timestamp of the article's pubDate and convert to Unix timestamp
               ARTICLE_TIME=$(date -d "$PUBDATE" +%s)
-              if [ $ARTICLE_TIME -lt $FIVE_MINUTES_AGO ]; then
-                echo "Skipping article: $TITLE (older than 5 minutes)"
+              if [ $ARTICLE_TIME -lt $TEN_MINUTES_AGO ]; then
+                echo "Skipping article: $TITLE (older than 10 minutes)"
                 continue
               fi
 
               HEADLINE_HASH=$(echo "$TITLE" | md5sum | cut -d ' ' -f 1)
-              if grep -q "$HEADLINE_HASH" .cache/last_5min_articles.txt; then
+              if grep -q "$HEADLINE_HASH" .cache/last_10min_articles.txt; then
                 echo "Skipping duplicate article: $TITLE"
                 continue
               fi
 
               HEADLINE_HASH=$(echo "$TITLE" | md5sum | cut -d ' ' -f 1)
-              echo "$HEADLINE_HASH" >> .cache/last_5min_articles.txt
+              echo "$HEADLINE_HASH" >> .cache/last_10min_articles.txt
 
               # 🔎 Categorize the article
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
@@ -114,15 +114,15 @@ jobs:
                 RECOMMENDATION="HOLD"
               fi
 
-              # 🔐 Deduplication check: Skip if already sent within the last 5 minutes
+              # 🔐 Deduplication check: Skip if already sent within the last 10 minutes
               HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
               if grep -q "$HASH" .cache/sent_hashes.txt; then
                 continue
               fi
               echo "$HASH" >> .cache/sent_hashes.txt
 
-              # Add the headline to the list of last 5 minutes' articles
-              echo "$HEADLINE_HASH" >> .cache/last_5min_articles.txt
+              # Add the headline to the list of last 10 minutes' articles
+              echo "$HEADLINE_HASH" >> .cache/last_10min_articles.txt
 
               # 🧱 Format Slack message with real line breaks
               TEXT=$(printf ":bell: *New Article:*\n%s *%s*\n:page_facing_up: %s\n:link: <%s|Read more>\n:clock3: *Posted:* %s\n───────────────" \
