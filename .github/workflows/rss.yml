@@ -56,7 +56,7 @@ jobs:
 
           # Get the current time and calculate the cutoff time for the last 5 minutes
           CURRENT_TIME=$(date +%s)
-          FIVE_MINUTES_AGO=$(($CURRENT_TIME - 300))  # Subtract 300 seconds (5 minutes)
+          FIVE_MINUTES_AGO=$(($CURRENT_TIME - 600))  # Subtract 300 seconds (5 minutes)
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
@@ -73,7 +73,7 @@ jobs:
               [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
               [ -z "$PUBDATE" ] && PUBDATE="(No date provided)"
 
-              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | head -c 300)
+              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | head -c 600)
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
