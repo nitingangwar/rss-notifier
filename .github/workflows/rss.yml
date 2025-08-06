@@ -10,9 +10,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Cache APT dependencies
+      # Step 1: Cache APT dependencies (optional but speeds up installs)
       - name: Cache APT dependencies
-        uses: actions/cache@v3  # Updated to v3
+        uses: actions/cache@v3
         with:
           path: /tmp/apt-cache
           key: ${{ runner.os }}-apt-cache-${{ hashFiles('**/package-lock.json') }}
@@ -25,7 +25,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq curl
 
-      # Step 3: Download previous hashes (if any) from the previous run
+      # Step 3: Download previous hashes (if any)
       - name: Download previous hashes (if any)
         uses: actions/download-artifact@v4
         with:
@@ -33,7 +33,7 @@ jobs:
           path: .cache
         continue-on-error: true  # Continue if artifact is not found
 
-      # Step 4: Create cache file if not exists (for storing article hashes)
+      # Step 4: Create cache files if not exists
       - name: Create cache file if not exists
         run: |
           mkdir -p .cache
@@ -56,6 +56,9 @@ jobs:
           # Get the current time and calculate the cutoff time for the last 10 minutes
           CURRENT_TIME=$(date +%s)
           TEN_MINUTES_AGO=$(($CURRENT_TIME - 600))  # Subtract 600 seconds (10 minutes)
+
+          # Flag to track if there are new articles
+          NEW_ARTICLE_FOUND=false
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
@@ -134,10 +137,19 @@ jobs:
               curl -X POST "${WEBHOOKS[$CATEGORY]}" \
                 -H 'Content-type: application/json' \
                 --data "$PAYLOAD"
+
+              # Set the flag to indicate that a new article was found
+              NEW_ARTICLE_FOUND=true
             done
           done
 
-      # Step 6: Upload updated hashes
+          # Step 6: If no new article was found, exit early
+          if [ "$NEW_ARTICLE_FOUND" = false ]; then
+            echo "No new articles found in the last 10 minutes. Exiting."
+            exit 0
+          fi
+
+      # Step 7: Upload updated hashes
       - name: Upload updated hashes
         uses: actions/upload-artifact@v4
         with:
