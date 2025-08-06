@@ -1,10 +1,9 @@
 name: Categorized RSS Alerts with Sentiment
 
 on:
-  # Comment or remove this to avoid triggering by GitHub's own cron schedule
-  # schedule:
-  #   - cron: "*/10 * * * *"  # This is GitHub's internal cron schedule (comment out)
-  workflow_dispatch:  # Trigger manually or by external system like cron-job.org
+  workflow_dispatch:  # Trigger manually via GitHub
+  schedule:
+    - cron: "*/10 * * * *"  # Trigger every 10 minutes (can adjust as needed)
 
 jobs:
   notify:
@@ -25,7 +24,7 @@ jobs:
           path: .cache
         continue-on-error: true  # Continue if artifact is not found
 
-      # Step 3: Check if the file exists before uploading
+      # Step 3: Verify the existence of the file before uploading
       - name: Verify the existence of the file before upload
         run: |
           echo "Checking for .cache/sent_hashes.txt"
