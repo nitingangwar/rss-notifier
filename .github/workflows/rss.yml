@@ -2,24 +2,24 @@ name: Categorized RSS Alerts with Sentiment
 
 on:
   workflow_dispatch:  # Trigger manually via GitHub
-  schedule:
-    - cron: "*/10 * * * *"  # Trigger every 10 minutes (can adjust as needed)
+  # schedule:
+  #  - cron: "*/10 * * * *"  # Trigger every 10 minutes (can adjust as needed)
 
 jobs:
   notify:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Cache installed apt packages to speed up installation
-      - name: Cache apt dependencies
-        uses: actions/cache@v2
+      # Step 1: Cache APT dependencies
+      - name: Cache APT dependencies
+        uses: actions/cache@v3  # Updated to v3
         with:
           path: /tmp/apt-cache
           key: ${{ runner.os }}-apt-cache-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-apt-cache-
 
-      # Step 2: Set up the environment and install only missing dependencies
+      # Step 2: Set up the environment
       - name: Set up environment
         run: |
           sudo apt-get update
