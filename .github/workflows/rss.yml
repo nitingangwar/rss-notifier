@@ -37,7 +37,7 @@ jobs:
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
-            "https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
+            "https://www.prnewswire.com/rss/news-releases-list.rss"
           )
 
           declare -A WEBHOOKS
