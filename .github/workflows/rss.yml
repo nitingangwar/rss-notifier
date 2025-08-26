@@ -3,29 +3,20 @@ name: Categorized RSS Alerts with Sentiment
 on:
   workflow_dispatch:  # Trigger manually via GitHub
   # schedule:
-  #  - cron: "*/10 * * * *"  # Trigger every 10 minutes (can adjust as needed)
+  #   - cron: "*/10 * * * *"  # Trigger every 10 minutes (can adjust as needed)
 
 jobs:
   notify:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Cache APT dependencies (optional but speeds up installs)
-      - name: Cache APT dependencies
-        uses: actions/cache@v3
-        with:
-          path: /tmp/apt-cache
-          key: ${{ runner.os }}-apt-cache-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-cache-
-
-      # Step 2: Set up the environment
+      # Step 1: Set up the environment
       - name: Set up environment
         run: |
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq curl
 
-      # Step 3: Download previous hashes (if any)
+      # Step 2: Download previous hashes (if any)
       - name: Download previous hashes (if any)
         uses: actions/download-artifact@v4
         with:
@@ -33,19 +24,20 @@ jobs:
           path: .cache
         continue-on-error: true  # Continue if artifact is not found
 
-      # Step 4: Create cache files if not exists
+      # Step 3: Create cache files if not exists
       - name: Create cache file if not exists
         run: |
           mkdir -p .cache
           touch .cache/sent_hashes.txt
           touch .cache/last_10min_articles.txt
 
-      # Step 5: Parse RSS Feeds, perform sentiment analysis, and send to Slack
+      # Step 4: Parse RSS Feeds and Post to Slack
       - name: Parse RSS Feeds and Post to Slack
         run: |
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
+            "https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
           )
 
           declare -A WEBHOOKS
@@ -55,15 +47,15 @@ jobs:
 
           # Get the current time and calculate the cutoff time for the last 10 minutes
           CURRENT_TIME=$(date +%s)
-          TEN_MINUTES_AGO=$(($CURRENT_TIME - 600))  # Subtract 600 seconds (10 minutes)
+          TEN_MINUTES_AGO=$((CURRENT_TIME - 600))  # 10 minutes
 
-          # Flag to track if there are new articles
           NEW_ARTICLE_FOUND=false
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
             XML=$(curl -s "$FEED_URL")
 
+            # Check the first 3 entries per feed (adjust if you want more)
             for i in 1 2 3; do
               LINK=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href)" - 2>/dev/null)
               TITLE=$(echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/title)" - 2>/dev/null)
@@ -79,23 +71,21 @@ jobs:
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
-              # Get the timestamp of the article's pubDate and convert to Unix timestamp
-              ARTICLE_TIME=$(date -d "$PUBDATE" +%s)
-              if [ $ARTICLE_TIME -lt $TEN_MINUTES_AGO ]; then
-                echo "Skipping article: $TITLE (older than 10 minutes)"
+              # Time filter (last 10 minutes)
+              ARTICLE_TIME=$(date -d "$PUBDATE" +%s 2>/dev/null || echo $CURRENT_TIME)
+              if [ "$ARTICLE_TIME" -lt "$TEN_MINUTES_AGO" ]; then
+                echo "⏱️ Skipping: $TITLE (older than 10 minutes)"
                 continue
               fi
 
+              # Short-term dedupe (headline) within last 10 minutes file
               HEADLINE_HASH=$(echo "$TITLE" | md5sum | cut -d ' ' -f 1)
               if grep -q "$HEADLINE_HASH" .cache/last_10min_articles.txt; then
-                echo "Skipping duplicate article: $TITLE"
+                echo "🔁 Skipping duplicate headline (10-min window): $TITLE"
                 continue
               fi
 
-              HEADLINE_HASH=$(echo "$TITLE" | md5sum | cut -d ' ' -f 1)
-              echo "$HEADLINE_HASH" >> .cache/last_10min_articles.txt
-
-              # 🔎 Categorize the article
+              # Categorize
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
                 CATEGORY="medical"
               elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
@@ -104,7 +94,7 @@ jobs:
                 CATEGORY="general"
               fi
 
-              # 😊 Sentiment Detection
+              # Sentiment + naive recommendation
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT=":large_green_circle: [POSITIVE]"
                 RECOMMENDATION="BUY"
@@ -116,42 +106,42 @@ jobs:
                 RECOMMENDATION="HOLD"
               fi
 
-              # 🔐 Deduplication check: Skip if already sent within the last 10 minutes
+              # Global dedupe (by LINK) across runs
               HASH=$(echo "$LINK" | md5sum | cut -d ' ' -f 1)
               if grep -q "$HASH" .cache/sent_hashes.txt; then
+                echo "🧭 Already sent (by link): $TITLE"
                 continue
               fi
-              echo "$HASH" >> .cache/sent_hashes.txt
 
-              # Add the headline to the list of last 10 minutes' articles
-              echo "$HEADLINE_HASH" >> .cache/last_10min_articles.txt
-
-              # 🧱 Format Slack message with real line breaks
+              # Build Slack message
               TEXT=$(printf ":bell: *New Article:*\n%s *%s*\n:page_facing_up: %s\n:link: <%s|Read more>\n:clock3: *Posted:* %s\n───────────────" \
                 "$SENTIMENT" "$TITLE" "$DESCRIPTION" "$LINK" "$PUBDATE")
 
               PAYLOAD=$(jq -n --arg text "$TEXT" \
                 '{blocks: [ { type: "section", text: { type: "mrkdwn", text: $text } } ]}')
 
-              echo "📤 Sending to Slack ($CATEGORY)..."
-              curl -X POST "${WEBHOOKS[$CATEGORY]}" \
+              echo "📤 Sending to Slack ($CATEGORY)…"
+              curl -s -X POST "${WEBHOOKS[$CATEGORY]}" \
                 -H 'Content-type: application/json' \
-                --data "$PAYLOAD"
+                --data "$PAYLOAD" >/dev/null || true
 
-              # Set the flag to indicate that a new article was found
+              # Mark as sent (by link) and remember headline for 10-min window
+              echo "$HASH" >> .cache/sent_hashes.txt
+              echo "$HEADLINE_HASH" >> .cache/last_10min_articles.txt
+
               NEW_ARTICLE_FOUND=true
             done
           done
 
-          # Step 6: If no new article was found, exit early
+          # Exit early (so we don't upload artifacts pointlessly) if nothing was new
           if [ "$NEW_ARTICLE_FOUND" = false ]; then
-            echo "No new articles found in the last 10 minutes. Exiting."
+            echo "✅ No new articles in the last 10 minutes."
             exit 0
           fi
 
-      # Step 7: Upload updated hashes
+      # Step 5: Upload updated hashes (artifact)
       - name: Upload updated hashes
         uses: actions/upload-artifact@v4
         with:
-          name: rss-cache  # Ensure correct artifact name
-          path: .cache/sent_hashes.txt  # Path to upload
+          name: rss-cache
+          path: .cache/sent_hashes.txt
