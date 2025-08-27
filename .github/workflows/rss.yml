@@ -37,79 +37,78 @@ jobs:
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
       - name: Build/refresh US symbol database (NASDAQ/NYSE/Arca/Amex)
-        run: |
-          set -euo pipefail
-          refresh=false
-          # Refresh daily
-          if [ -f .cache/symbol_db.stamp ]; then
-            last=$(cat .cache/symbol_db.stamp || true)
-          else
-            last=""
-          fi
-          today=$(date -u +%F)
-          [ "$last" != "$today" ] && refresh=true
+  shell: bash
+  run: |
+    set -euo pipefail
+    refresh=false
+    mkdir -p .cache
 
-          if [ "$refresh" = true ] || [ ! -s .cache/symbol_db.json ]; then
-            echo "🔄 Refreshing symbol DB…"
-            curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt -o /tmp/nasdaqtraded.txt
-            curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt -o /tmp/otherlisted.txt
+    # Refresh daily
+    if [ -f .cache/symbol_db.stamp ]; then
+      last=$(cat .cache/symbol_db.stamp || true)
+    else
+      last=""
+    fi
+    today=$(date -u +%F)
+    [ "$last" != "$today" ] && refresh=true
 
-            # Parse NASDAQ file (pipe-delimited, header & footer lines included)
-            awk -F'|' 'NR>1 && $0 !~ /File Creation Time/ && $0 !~ /^Symbol\|/ && $0!="" {
-              sym=$1; name=$2; exch=$4; # ListingExchange field
-              # Normalize exchange display
-              if (exch=="Q") exd="NASDAQ"; else exd="NASDAQ";
-              printf "%s\t%s\t%s\n", sym, name, exd
-            }' /tmp/nasdaqtraded.txt > /tmp/all_listed.tsv
+    if [ "$refresh" = true ] || [ ! -s .cache/symbol_db.json ]; then
+      echo "🔄 Refreshing symbol DB…"
+      curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt -o /tmp/nasdaqtraded.txt
+      curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt -o /tmp/otherlisted.txt
 
-            # Parse OTHERLISTED (NYSE/Arca/Amex). Format: ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol
-            awk -F'|' 'NR>1 && $0!="" {
-              sym=$1; name=$2; exch=$3;
-              exd=(exch=="N"?"NYSE":(exch=="A"?"NYSE American":(exch=="P"?"NYSE Arca":exch)));
-              printf "%s\t%s\t%s\n", sym, name, exd
-            }' /tmp/otherlisted.txt >> /tmp/all_listed.tsv
+      # Parse NASDAQ file (pipe-delimited, header/footer present)
+      awk -F'|' 'NR>1 && $0 !~ /File Creation Time/ && $0 !~ /^Symbol\|/ && $0!="" {
+        sym=$1; name=$2; exch=$4; # Q/N/A/P/…
+        exd="NASDAQ";
+        printf "%s\t%s\t%s\n", sym, name, exd
+      }' /tmp/nasdaqtraded.txt > /tmp/all_listed.tsv
 
-            # Build JSON map { normalized_name: {ticker, exchange} }
-            norm() {
-              sed 's/[™®©]//g' | sed 's/[“”"()]//g' | sed 's/&/ and /g' \
-              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/ +/ /g; s/^ +| +$//g' | tr "[:upper:]" "[:lower:]"
-            }
+      # Parse OTHERLISTED (NYSE/Arca/Amex)
+      awk -F'|' 'NR>1 && $0!="" {
+        sym=$1; name=$2; exch=$3;
+        exd=(exch=="N"?"NYSE":(exch=="A"?"NYSE American":(exch=="P"?"NYSE Arca":exch)));
+        printf "%s\t%s\t%s\n", sym, name, exd
+      }' /tmp/otherlisted.txt >> /tmp/all_listed.tsv
 
-            # Use jq to assemble—also include a few alternate keys (first 2 tokens, no punctuation) for better matching
-            python3 - <<'PY' > .cache/symbol_db.json
-import json,sys,re
+      # === write python file safely (no YAML confusion) ===
+      cat > /tmp/build_symbol_db.py <<'PY'
+import json, re, sys
 db={}
 def norm(s):
-  s=re.sub(r'[™®©]', '', s)
-  s=re.sub(r'[“”"()]', '', s)
-  s=s.replace('&',' and ')
-  s=re.sub(r'\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?', '', s, flags=re.I)
-  s=re.sub(r'\s+',' ',s).strip().lower()
-  return s
+    s=re.sub(r'[™®©]', '', s)
+    s=re.sub(r'[“”"()]', '', s)
+    s=s.replace('&',' and ')
+    s=re.sub(r'\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?', '', s, flags=re.I)
+    s=re.sub(r'\s+',' ',s).strip().lower()
+    return s
 
 with open('/tmp/all_listed.tsv','r',encoding='utf-8',errors='ignore') as f:
-  for line in f:
-    parts=line.rstrip('\n').split('\t')
-    if len(parts)<3: continue
-    sym, name, exch = parts[0], parts[1], parts[2]
-    if not sym or not name or not exch: continue
-    key = norm(name)
-    if key: db[key]={"ticker":sym,"exchange":exch}
-    # alternates: first 2 tokens; first token (helps "Sungrow Inverters"→"Sungrow")
-    toks=[t for t in re.split(r'\s+', re.sub(r'[^\w\-\. ]','',name)) if t]
-    if toks:
-      alt1 = norm(' '.join(toks[:2]))
-      if alt1 and alt1 not in db: db[alt1]={"ticker":sym,"exchange":exch}
-      alt2 = norm(toks[0])
-      if alt2 and alt2 not in db: db[alt2]={"ticker":sym,"exchange":exch}
+    for line in f:
+        parts=line.rstrip('\n').split('\t')
+        if len(parts)<3: continue
+        sym, name, exch = parts[0], parts[1], parts[2]
+        if not sym or not name or not exch: continue
+        key = norm(name)
+        if key: db[key]={"ticker":sym,"exchange":exch}
+        # alternates to help fuzzy: first 2 tokens, and first token
+        toks=[t for t in re.split(r'\s+', re.sub(r'[^\w\-\. ]','',name)) if t]
+        if toks:
+            alt1 = norm(' '.join(toks[:2]))
+            if alt1 and alt1 not in db: db[alt1]={"ticker":sym,"exchange":exch}
+            alt2 = norm(toks[0])
+            if alt2 and alt2 not in db: db[alt2]={"ticker":sym,"exchange":exch}
+
 json.dump(db, sys.stdout)
 PY
-            date -u +%F > .cache/symbol_db.stamp
-            echo "✅ Symbol DB entries: $(jq 'keys|length' .cache/symbol_db.json)"
-          else
-            echo "🟢 Using cached symbol DB (entries: $(jq 'keys|length' .cache/symbol_db.json))"
-          fi
+
+      python3 /tmp/build_symbol_db.py > .cache/symbol_db.json
+      date -u +%F > .cache/symbol_db.stamp
+      echo "✅ Symbol DB entries: $(jq 'keys|length' .cache/symbol_db.json)"
+    else
+      echo "🟢 Using cached symbol DB (entries: $(jq 'keys|length' .cache/symbol_db.json))"
+    fi
+
 
       - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
         env:
