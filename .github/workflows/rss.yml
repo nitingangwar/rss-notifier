@@ -37,6 +37,15 @@ jobs:
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
 
+      # 3a) (Optional) Sanity-check Yahoo endpoint (logs only; non-blocking)
+      - name: Sanity-check Yahoo search endpoint
+        run: |
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          echo "🔎 Yahoo Finance search sanity check (Apple):"
+          curl -sL --max-time 6 -H "User-Agent: $UA" \
+            "https://query1.finance.yahoo.com/v1/finance/search?q=Apple&quotesCount=2&newsCount=0" \
+            | jq '.quotes[0] | {symbol,exchDisp}' || true
+
       # 4) Parse feeds, categorize, dedupe, PRN exchange-filter via inventory, and send to Slack
       - name: Parse RSS Feeds and Post to Slack
         env:
@@ -65,6 +74,10 @@ jobs:
           # Negative-cache TTL (days) for company lookups that didn't resolve to US exchanges
           NEG_TTL_DAYS=30
           NEG_TTL_SEC=$((NEG_TTL_DAYS * 24 * 3600))
+
+          # Yahoo reliability hardening
+          YF_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          YF_LANG='en-US,en;q=0.9'
 
           CURRENT_TIME=$(date -u +%s)
           TEN_MINUTES_AGO=$((CURRENT_TIME - WINDOW_SEC))
@@ -158,17 +171,39 @@ jobs:
 
               # negative/unknown: honor TTL
               age=$(( now_epoch - last_epoch ))
-              if [ "$last_epoch" > 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then
+              if [ "$last_epoch" -gt 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then
                 echo "$entry"
                 return 0
               fi
             fi
 
-            # 2) Remote search (Yahoo Finance) — public endpoint; could change anytime
+            # 2) Remote search (Yahoo Finance) — add UA, retry/backoff, fallback
             local q url j ok symbol exchDisp
             q=$(printf '%s' "$raw" | sed 's/ /%20/g')
-            url="https://query1.finance.yahoo.com/v1/finance/search?q=$q&quotesCount=5&newsCount=0"
-            j=$(curl -sL --max-time 8 "$url" || echo '')
+
+            # primary search with retries
+            max_tries=3
+            sleep_s=1
+            j=""
+            for try in $(seq 1 $max_tries); do
+              j=$(curl -sL --max-time 8 \
+                    -H "User-Agent: $YF_UA" \
+                    -H "Accept-Language: $YF_LANG" \
+                    "https://query1.finance.yahoo.com/v1/finance/search?q=$q&quotesCount=5&newsCount=0" || true)
+              if echo "$j" | jq -e '.quotes | length >= 1' >/dev/null 2>&1; then
+                break
+              fi
+              sleep "$sleep_s"; sleep_s=$(( sleep_s * 2 ))
+            done
+
+            # fallback lookup if primary was empty/flaky
+            if ! echo "$j" | jq -e '.quotes | length >= 1' >/dev/null 2>&1; then
+              j=$(curl -sL --max-time 8 \
+                    -H "User-Agent: $YF_UA" \
+                    -H "Accept-Language: $YF_LANG" \
+                    "https://query1.finance.yahoo.com/v1/finance/lookup?formatted=true&lang=en-US&region=US&query=$q&type=equity&count=5" || true)
+            fi
+
             ok=false
             symbol=""
             exchDisp=""
