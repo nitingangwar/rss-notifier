@@ -1,4 +1,4 @@
-name: Test PRN Company Resolver
+name: Categorized RSS Alerts with Sentiment
 
 on:
   workflow_dispatch:
