@@ -20,13 +20,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq curl coreutils
 
-      # 2) Restore cache (if it exists)
-      - name: Download previous cache (if any)
-        uses: actions/download-artifact@v4
+      # 2) Restore/prime cross-run cache (mutable state for dedupe + inventory)
+      - name: Restore cache
+        uses: actions/cache@v4
         with:
-          name: rss-cache
           path: .cache
-        continue-on-error: true
+          key: rss-cache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            rss-cache-${{ runner.os }}-
 
       # 3) Ensure cache files exist
       - name: Create cache files if not exists
@@ -36,7 +37,7 @@ jobs:
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
 
-      # 4) Parse feeds, categorize, dedupe, exchange-filter with inventory, and send to Slack
+      # 4) Parse feeds, categorize, dedupe, PRN exchange-filter via inventory, and send to Slack
       - name: Parse RSS Feeds and Post to Slack
         env:
           SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
@@ -157,7 +158,7 @@ jobs:
 
               # negative/unknown: honor TTL
               age=$(( now_epoch - last_epoch ))
-              if [ "$last_epoch" -gt 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then
+              if [ "$last_epoch" > 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then
                 echo "$entry"
                 return 0
               fi
@@ -330,10 +331,3 @@ jobs:
           if [ "$NEW_ARTICLE_FOUND" = false ]; then
             echo "✅ No new articles in the last 10 minutes."
           fi
-
-      # 5) Persist the entire cache directory (hashes + company inventory)
-      - name: Upload updated cache
-        uses: actions/upload-artifact@v4
-        with:
-          name: rss-cache
-          path: .cache/
