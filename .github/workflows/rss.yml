@@ -1,25 +1,28 @@
-name: Categorized RSS Alerts with Sentiment
+name: Test PRN Company Resolver
 
 on:
-  workflow_dispatch: {}
-  # schedule:
-  #   - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      extra_headlines:
+        description: 'Optional | Comma-separated headlines to test in addition to defaults'
+        required: false
+        default: ''
 
 concurrency:
-  group: rss-alerts
+  group: test-company-resolver
   cancel-in-progress: false
 
 jobs:
-  notify:
+  test_lookup:
     runs-on: ubuntu-latest
 
     steps:
       - name: Set up environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxml2-utils w3m jq curl coreutils
+          sudo apt-get install -y jq curl coreutils
 
-      # Cross-run cache for dedupe + inventory
+      # Use the same cache location/file as your main workflow
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -28,64 +31,24 @@ jobs:
           restore-keys: |
             rss-cache-${{ runner.os }}-
 
-      - name: Create cache files if not exists
+      - name: Ensure inventory exists
         run: |
           mkdir -p .cache
-          [ -f .cache/sent_hashes.txt ] || touch .cache/sent_hashes.txt
-          [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
 
-      - name: Sanity-check Yahoo search endpoint
-        run: |
-          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          echo "🔎 Yahoo Finance search sanity check (Apple):"
-          curl -sL --max-time 6 -H "User-Agent: $UA" \
-            "https://query1.finance.yahoo.com/v1/finance/search?q=Apple&quotesCount=2&newsCount=0" \
-            | jq '.quotes[0] | {symbol,exchDisp}' || true
-
-      - name: Parse RSS Feeds and Post to Slack
+      - name: Run resolver on sample headlines
         env:
-          SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
-          SLACK_WEBHOOK_MEDICAL: ${{ secrets.SLACK_WEBHOOK_MEDICAL }}
-          SLACK_WEBHOOK_CONTRACTS: ${{ secrets.SLACK_WEBHOOK_CONTRACTS }}
+          EXTRA: ${{ github.event.inputs.extra_headlines }}
         run: |
           set -euo pipefail
 
-          # ---------- Safe helpers (no brittle pipes) ----------
-          safe_json_has_quotes() { jq -e '.quotes | length >= 1' <<<"$1" >/dev/null 2>&1; }
-          safe_json_is_valid()   { jq -e . <<<"$1" >/dev/null 2>&1; }
-          safe_xpath() { xmllint --xpath "string($2)" "$1" 2>/dev/null || true; }
-
-          FEEDS=(
-            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
-            "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
-            "https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
-          )
-          PRN_FEED="https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
-
-          declare -A WEBHOOKS=(
-            [general]="${SLACK_WEBHOOK_GENERAL}"
-            [medical]="${SLACK_WEBHOOK_MEDICAL}"
-            [contracts]="${SLACK_WEBHOOK_CONTRACTS}"
-          )
-
-          PER_FEED_ITEMS=3
-          WINDOW_SEC=600
+          # ---- Config (same as main workflow) ----
           NEG_TTL_DAYS=30
           NEG_TTL_SEC=$((NEG_TTL_DAYS * 24 * 3600))
-
           YF_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
           YF_LANG='en-US,en;q=0.9'
 
-          CURRENT_TIME=$(date -u +%s)
-          TEN_MINUTES_AGO=$((CURRENT_TIME - WINDOW_SEC))
-
-          # Prune rolling 10-min headline cache (format: "<epoch> <headline_hash>")
-          awk -v cutoff="$TEN_MINUTES_AGO" '{
-            if (NF >= 2) { epoch=$1; if (epoch ~ /^[0-9]+$/ && epoch >= cutoff) print $0; }
-          }' .cache/last_10min_articles.txt > .cache/_pruned.tmp || true
-          mv .cache/_pruned.tmp .cache/last_10min_articles.txt
-
+          # ---- Helpers (same logic as main) ----
           norm_company_name() {
             echo "$1" \
               | sed 's/[™®©]//g' \
@@ -99,15 +62,11 @@ jobs:
           extract_company_from_title() {
             local t="$1"
             local pre first cleaned
-
             pre=$(echo "$t" | sed -E 's/ — / - /g' | awk -F' - |:|\\|\\|' '{print $1}')
             [ -z "$pre" ] && pre="$t"
             pre=$(echo "$pre" | tr -s ' ')
             first=$(echo "$pre" | awk '{print $1}')
-            if echo "$first" | grep -qE '^[A-Z0-9\-]{2,}$'; then
-              echo "$first"; return 0
-            fi
-
+            if echo "$first" | grep -qE '^[A-Z0-9\-]{2,}$'; then echo "$first"; return 0; fi
             local VERBS='launches|announces|reports|unveils|introduces|reveals|confirms|completes|signs|wins|awarded|enters|partners|acquires|files|prices|lists|successfully|passes|secures|appoints|names|extends|expands'
             cleaned=$(echo "$pre" | awk -v verbs="$VERBS" '{
               if (NF>=2) {
@@ -115,10 +74,7 @@ jobs:
                 cmd="echo \"" second "\" | tr \"[:upper:]\" \"[:lower:]\""
                 cmd | getline second_lc; close(cmd)
                 if (second_lc ~ "^(" verbs ")$") { $2=""; sub(/^  +/,""); gsub(/  +/," "); }
-              }
-              print
-            }')
-
+              } print }')
             local GENERIC_NOUNS='inverters|series|platform|solution|solutions|product|products|system|systems|software|hardware|services|technology|technologies|network|appliance|appliances|device|devices'
             cleaned=$(echo "$cleaned" | sed -E "s/\\b($GENERIC_NOUNS)\\b( |$)//I")
             cleaned=$(echo "$cleaned" | awk '{for(i=1;i<=NF && i<=6;i++) printf (i==1?$i:" "$i); print ""}')
@@ -127,56 +83,41 @@ jobs:
             echo "$cleaned"
           }
 
+          safe_json_has_quotes() { jq -e '.quotes | length >= 1' <<<"$1" >/dev/null 2>&1; }
+          safe_json_is_valid()   { jq -e . <<<"$1" >/dev/null 2>&1; }
+
           lookup_company_exchange() {
             local raw="$1"
             local key norm entry cached_ticker cached_exchange last_checked last_epoch age
-            norm=$(norm_company_name "$raw")
-            key="$norm"
+            norm=$(norm_company_name "$raw"); key="$norm"
+            local now_epoch; now_epoch=$(date -u +%s)
 
-            local now_epoch
-            now_epoch=$(date -u +%s)
-
-            # Inventory check (TTL for negative)
+            # 1) Inventory with TTL for negative
             if jq -e --arg k "$key" 'has($k)' .cache/company_index.json >/dev/null; then
               entry=$(jq -r --arg k "$key" '.[$k]' .cache/company_index.json)
               cached_ticker=$(jq -r '.ticker' <<<"$entry")
               cached_exchange=$(jq -r '.exchange' <<<"$entry")
               last_checked=$(jq -r '.last_checked' <<<"$entry")
               last_epoch=$(date -u -d "$last_checked" +%s 2>/dev/null || echo 0)
-
-              if [ "$cached_ticker" != "null" ] && [ -n "$cached_ticker" ]; then
-                echo "$entry"; return 0
-              fi
-
+              if [ "$cached_ticker" != "null" ] && [ -n "$cached_ticker" ]; then echo "$entry"; return 0; fi
               age=$(( now_epoch - last_epoch ))
-              if [ "$last_epoch" -gt 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then
-                echo "$entry"; return 0
-              fi
+              if [ "$last_epoch" -gt 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then echo "$entry"; return 0; fi
             fi
 
-            # Yahoo search with UA + retry/backoff, then fallback
-            local q j ok symbol exchDisp
-            q=$(printf '%s' "$raw" | sed 's/ /%20/g')
+            # 2) Yahoo search with UA + retry/backoff, then fallback
+            local q j ok symbol exchDisp; q=$(printf '%s' "$raw" | sed 's/ /%20/g')
             ok=false; symbol=""; exchDisp=""; j=""
-
             max_tries=3; sleep_s=1
             for try in $(seq 1 $max_tries); do
-              j=$(curl -sL --max-time 8 \
-                    -H "User-Agent: $YF_UA" \
-                    -H "Accept-Language: $YF_LANG" \
-                    "https://query1.finance.yahoo.com/v1/finance/search?q=$q&quotesCount=5&newsCount=0" || true)
+              j=$(curl -sL --max-time 8 -H "User-Agent: $YF_UA" -H "Accept-Language: $YF_LANG" \
+                  "https://query1.finance.yahoo.com/v1/finance/search?q=$q&quotesCount=5&newsCount=0" || true)
               safe_json_is_valid "$j" || j=""
-              if [ -n "$j" ] && safe_json_has_quotes "$j"; then
-                break
-              fi
+              if [ -n "$j" ] && safe_json_has_quotes "$j"; then break; fi
               sleep "$sleep_s"; sleep_s=$(( sleep_s * 2 ))
             done
-
             if [ -z "$j" ] || ! safe_json_has_quotes "$j"; then
-              j=$(curl -sL --max-time 8 \
-                    -H "User-Agent: $YF_UA" \
-                    -H "Accept-Language: $YF_LANG" \
-                    "https://query1.finance.yahoo.com/v1/finance/lookup?formatted=true&lang=en-US&region=US&query=$q&type=equity&count=5" || true)
+              j=$(curl -sL --max-time 8 -H "User-Agent: $YF_UA" -H "Accept-Language: $YF_LANG" \
+                  "https://query1.finance.yahoo.com/v1/finance/lookup?formatted=true&lang=en-US&region=US&query=$q&type=equity&count=5" || true)
               safe_json_is_valid "$j" || j=""
             fi
 
@@ -199,161 +140,56 @@ jobs:
                  '.[$k] = {ticker:$sym, exchange:$exd, last_checked:$t}' \
                  .cache/company_index.json > "$tmp" && mv "$tmp" .cache/company_index.json
               echo "{\"ticker\":\"$symbol\",\"exchange\":\"$exchDisp\"}"
-              return 0
             else
               tmp=$(mktemp)
               jq --arg k "$key" --arg t "$(date -u +%FT%TZ)" \
                  '.[$k] = {ticker:null, exchange:null, last_checked:$t}' \
                  .cache/company_index.json > "$tmp" && mv "$tmp" .cache/company_index.json
               echo '{"ticker":null,"exchange":null}'
-              return 0
             fi
           }
 
-          NEW_ARTICLE_FOUND=false
+          # ---- Default sample headlines ----
+          mapfile -t HEADLINES < <(cat <<'EOF'
+Apple Inc. announces new services bundle for enterprise customers
+AEWIN Launches SCB-1953 Series High-Performance Network Appliances Powered by Intel Xeon 6 Processors
+Sungrow Inverters Successfully Pass the Brazilian Grid Operator Validations
+NVIDIA and Oracle expand strategic collaboration to accelerate AI adoption
+Novo Nordisk announces completion of share repurchase program
+Taiwan Semiconductor Manufacturing Company to build advanced packaging facility in Japan
+JPMorgan Chase reports third quarter results
+MercadoLibre partners with company X to expand logistics in Brazil
+DraftKings announces pricing of senior notes offering
+Micron Technology unveils next-gen HBM4 memory
+EOF
+          )
 
-          for FEED_URL in "${FEEDS[@]}"; do
-            echo "🔍 Checking Feed: $FEED_URL"
-
-            XML_FILE=$(mktemp)
-            curl -sL "$FEED_URL" > "$XML_FILE" || true
-            if [ ! -s "$XML_FILE" ]; then
-              echo "⚠️  Empty response from feed."
-              rm -f "$XML_FILE"
-              continue
-            fi
-
-            for i in $(seq 1 "$PER_FEED_ITEMS"); do
-              LINK=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href")
-              TITLE=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/title")
-              DESCRIPTION=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/description | //entry[$i]/summary")
-              PUBDATE=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/pubDate | //entry[$i]/updated")
-
-              [ -z "$LINK" ] && continue
-              [ -z "$TITLE" ] && TITLE="(No Title)"
-              [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
-              [ -z "$PUBDATE" ] && PUBDATE=""
-
-              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//' | head -c 300)
-              CONTENT="$TITLE $DESCRIPTION"
-              CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
-
-              ARTICLE_TIME=$(date -d "$PUBDATE" +%s 2>/dev/null || echo 0)
-              if [ "$ARTICLE_TIME" -eq 0 ] || [ "$ARTICLE_TIME" -lt "$TEN_MINUTES_AGO" ]; then
-                echo "⏱️ Skipping (invalid/old date): $TITLE"
-                continue
-              fi
-
-              HEADLINE_HASH=$(echo -n "$TITLE" | md5sum | cut -d ' ' -f1)
-              if grep -qx "$HEADLINE_HASH" <(awk '{print $2}' .cache/last_10min_articles.txt); then
-                echo "🔁 Skipping duplicate headline (10-min window): $TITLE"
-                continue
-              fi
-
-              LINK_HASH=$(echo -n "$LINK" | md5sum | cut -d ' ' -f1)
-              if grep -qx "$LINK_HASH" .cache/sent_hashes.txt; then
-                echo "🧭 Already sent (by link): $TITLE"
-                continue
-              fi
-              if grep -qx "$HEADLINE_HASH" .cache/sent_hashes.txt; then
-                echo "🧭 Already sent (by headline): $TITLE"
-                continue
-              fi
-
-              if [ "$FEED_URL" = "$PRN_FEED" ]; then
-                company_guess=$(extract_company_from_title "$TITLE")
-                info_json=$(lookup_company_exchange "$company_guess")
-                exch=$(jq -r '.exchange // empty' <<<"$info_json")
-                ticker=$(jq -r '.ticker // empty' <<<"$info_json")
-                if ! echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
-                  echo "🇺🇸⛔ Skipping PRN item not resolved to US exchange: $TITLE (company: $company_guess, exchange: ${exch:-unknown})"
-                  continue
-                fi
-                echo "🇺🇸✅ PRN item resolved to US exchange: $TITLE (company: $company_guess, exchange: $exch, ticker: ${ticker:-N/A})"
-              fi
-
-              if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
-                CATEGORY="medical"
-              elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
-                CATEGORY="contracts"
-              else
-                CATEGORY="general"
-              fi
-
-              if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
-                SENTIMENT=":large_green_circle: [POSITIVE]"
-                RECOMMENDATION="BUY"
-              elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
-                SENTIMENT=":red_circle: [NEGATIVE]"
-                RECOMMENDATION="SELL"
-              else
-                SENTIMENT=":white_circle: [NEUTRAL]"
-                RECOMMENDATION="HOLD"
-              fi
-
-              PAYLOAD=$(jq -n \
-                --arg title "$TITLE" \
-                --arg desc "$DESCRIPTION" \
-                --arg link "$LINK" \
-                --arg sentiment "$SENTIMENT" \
-                --arg pubdate "${PUBDATE:-Unknown}" \
-                --arg rec "$RECOMMENDATION" \
-                '{
-                  blocks: [
-                    { "type": "section", "text": { "type": "mrkdwn", "text": ":bell: *New Article*\n\($sentiment) *\($title)*" } },
-                    { "type": "section", "text": { "type": "mrkdwn", "text": ":page_facing_up: \($desc)" } },
-                    { "type": "context", "elements": [
-                        { "type": "mrkdwn", "text": ":link: <\($link)|Read more>" },
-                        { "type": "mrkdwn", "text": ":clock3: Posted: \($pubdate)" },
-                        { "type": "mrkdwn", "text": ":mag: Suggestion: *\($rec)*" }
-                      ]
-                    }
-                  ]
-                }')
-
-              echo "📤 Sending to Slack ($CATEGORY)…"
-              curl -s -X POST "${WEBHOOKS[$CATEGORY]}" \
-                -H 'Content-type: application/json' \
-                --data "$PAYLOAD" >/dev/null || true
-
-              echo "$LINK_HASH" >> .cache/sent_hashes.txt
-              echo "$HEADLINE_HASH" >> .cache/sent_hashes.txt
-              echo "$CURRENT_TIME $HEADLINE_HASH" >> .cache/last_10min_articles.txt
-
-              NEW_ARTICLE_FOUND=true
+          # ---- Optional extra headlines from workflow input (comma-separated) ----
+          if [ -n "${EXTRA:-}" ]; then
+            IFS=',' read -r -a EXTRA_ARR <<<"$EXTRA"
+            for h in "${EXTRA_ARR[@]}"; do
+              h_trim=$(echo "$h" | sed -E 's/^ +| +$//g')
+              [ -n "$h_trim" ] && HEADLINES+=("$h_trim")
             done
+          fi
 
-            rm -f "$XML_FILE"
+          echo "🧪 Testing ${#HEADLINES[@]} headlines…"
+
+          for H in "${HEADLINES[@]}"; do
+            company_guess=$(extract_company_from_title "$H")
+            info_json=$(lookup_company_exchange "$company_guess")
+            exch=$(jq -r '.exchange // empty' <<<"$info_json")
+            ticker=$(jq -r '.ticker // empty' <<<"$info_json")
+            if echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
+              echo "✅ US listing: '$H'"
+              echo "   → company:'$company_guess'  ticker:$ticker  exchange:$exch"
+            else
+              echo "⛔ Not US (or unresolved): '$H'"
+              echo "   → company:'$company_guess'  ticker:${ticker:-null}  exchange:${exch:-null}"
+            fi
           done
 
-          if [ "$NEW_ARTICLE_FOUND" = false ]; then
-            echo "✅ No new articles in the last 10 minutes."
-          fi
-
-      # ===== Inventory inspection & publishing =====
-
-      - name: Inspect company inventory (summary)
-        run: |
-          if [ ! -f .cache/company_index.json ]; then
-            echo "No inventory file yet."; exit 0;
-          fi
-
-          echo "📦 company_index.json"
-          ls -lh .cache/company_index.json
-
-          echo "Total entries:"
-          jq 'keys | length' .cache/company_index.json
-
-          echo "Positive entries (have ticker/exchange):"
-          jq '[ to_entries[] | select(.value.ticker != null and .value.exchange != null) ] | length' .cache/company_index.json
-
-          echo "Negative entries (null ticker/exchange):"
-          jq '[ to_entries[] | select(.value.ticker == null or .value.exchange == null) ] | length' .cache/company_index.json
-
-          echo "Sample positives (first 10):"
-          jq -r '[ to_entries[] | select(.value.ticker != null) ][0:10]' .cache/company_index.json
-
-      - name: Inventory summary (Job Summary)
+      - name: Inventory summary (counts + table)
         run: |
           if [ ! -f .cache/company_index.json ]; then
             echo "No inventory yet" >> "$GITHUB_STEP_SUMMARY"; exit 0;
@@ -361,7 +197,7 @@ jobs:
           POS=$(jq '[ to_entries[] | select(.value.ticker != null and .value.exchange != null) ] | length' .cache/company_index.json)
           NEG=$(jq '[ to_entries[] | select(.value.ticker == null or .value.exchange == null) ] | length' .cache/company_index.json)
           {
-            echo "### Company Inventory Summary"
+            echo "### Company Inventory Summary (Test Harness)"
             echo ""
             echo "| Metric | Count |"
             echo "|---|---:|"
@@ -369,7 +205,7 @@ jobs:
             echo "| Negatives (no match) | $NEG |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Publish company inventory (artifact)
+      - name: Publish inventory (artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
