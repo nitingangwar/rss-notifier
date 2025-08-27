@@ -1,7 +1,11 @@
 name: Categorized RSS Alerts with Sentiment
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths:
+      - .github/workflows/test-company-resolver.yml
     inputs:
       extra_headlines:
         description: 'Optional | Comma-separated headlines to test in addition to defaults'
