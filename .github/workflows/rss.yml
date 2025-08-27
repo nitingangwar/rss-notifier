@@ -17,9 +17,9 @@ jobs:
       - name: Set up environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxml2-utils w3m jq curl coreutils
+          sudo apt-get install -y libxml2-utils w3m jq curl coreutils gawk
 
-      # Cross-run cache for dedupe + inventory
+      # Cross-run cache for dedupe + inventory + symbol DB
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -34,18 +34,84 @@ jobs:
           [ -f .cache/sent_hashes.txt ] || touch .cache/sent_hashes.txt
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
+          [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      - name: Sanity-check Yahoo endpoints (logs only)
+      - name: Build/refresh US symbol database (NASDAQ/NYSE/Arca/Amex)
         run: |
-          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          echo "autoc (Apple):"
-          curl -sSL --max-time 8 -H "User-Agent: $UA" \
-            "https://autoc.finance.yahoo.com/autoc?query=Apple&region=US&lang=en-US" | head -c 300; echo
-          echo "search (Apple):"
-          curl -sSL --max-time 8 -H "User-Agent: $UA" \
-            "https://query1.finance.yahoo.com/v1/finance/search?q=Apple&quotesCount=2&newsCount=0" | head -c 300; echo
+          set -euo pipefail
+          refresh=false
+          # Refresh daily
+          if [ -f .cache/symbol_db.stamp ]; then
+            last=$(cat .cache/symbol_db.stamp || true)
+          else
+            last=""
+          fi
+          today=$(date -u +%F)
+          [ "$last" != "$today" ] && refresh=true
 
-      - name: Parse RSS Feeds, filter PRN via Yahoo, and Post to Slack
+          if [ "$refresh" = true ] || [ ! -s .cache/symbol_db.json ]; then
+            echo "🔄 Refreshing symbol DB…"
+            curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt -o /tmp/nasdaqtraded.txt
+            curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt -o /tmp/otherlisted.txt
+
+            # Parse NASDAQ file (pipe-delimited, header & footer lines included)
+            awk -F'|' 'NR>1 && $0 !~ /File Creation Time/ && $0 !~ /^Symbol\|/ && $0!="" {
+              sym=$1; name=$2; exch=$4; # ListingExchange field
+              # Normalize exchange display
+              if (exch=="Q") exd="NASDAQ"; else exd="NASDAQ";
+              printf "%s\t%s\t%s\n", sym, name, exd
+            }' /tmp/nasdaqtraded.txt > /tmp/all_listed.tsv
+
+            # Parse OTHERLISTED (NYSE/Arca/Amex). Format: ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol
+            awk -F'|' 'NR>1 && $0!="" {
+              sym=$1; name=$2; exch=$3;
+              exd=(exch=="N"?"NYSE":(exch=="A"?"NYSE American":(exch=="P"?"NYSE Arca":exch)));
+              printf "%s\t%s\t%s\n", sym, name, exd
+            }' /tmp/otherlisted.txt >> /tmp/all_listed.tsv
+
+            # Build JSON map { normalized_name: {ticker, exchange} }
+            norm() {
+              sed 's/[™®©]//g' | sed 's/[“”"()]//g' | sed 's/&/ and /g' \
+              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
+              | sed -E 's/ +/ /g; s/^ +| +$//g' | tr "[:upper:]" "[:lower:]"
+            }
+
+            # Use jq to assemble—also include a few alternate keys (first 2 tokens, no punctuation) for better matching
+            python3 - <<'PY' > .cache/symbol_db.json
+import json,sys,re
+db={}
+def norm(s):
+  s=re.sub(r'[™®©]', '', s)
+  s=re.sub(r'[“”"()]', '', s)
+  s=s.replace('&',' and ')
+  s=re.sub(r'\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?', '', s, flags=re.I)
+  s=re.sub(r'\s+',' ',s).strip().lower()
+  return s
+
+with open('/tmp/all_listed.tsv','r',encoding='utf-8',errors='ignore') as f:
+  for line in f:
+    parts=line.rstrip('\n').split('\t')
+    if len(parts)<3: continue
+    sym, name, exch = parts[0], parts[1], parts[2]
+    if not sym or not name or not exch: continue
+    key = norm(name)
+    if key: db[key]={"ticker":sym,"exchange":exch}
+    # alternates: first 2 tokens; first token (helps "Sungrow Inverters"→"Sungrow")
+    toks=[t for t in re.split(r'\s+', re.sub(r'[^\w\-\. ]','',name)) if t]
+    if toks:
+      alt1 = norm(' '.join(toks[:2]))
+      if alt1 and alt1 not in db: db[alt1]={"ticker":sym,"exchange":exch}
+      alt2 = norm(toks[0])
+      if alt2 and alt2 not in db: db[alt2]={"ticker":sym,"exchange":exch}
+json.dump(db, sys.stdout)
+PY
+            date -u +%F > .cache/symbol_db.stamp
+            echo "✅ Symbol DB entries: $(jq 'keys|length' .cache/symbol_db.json)"
+          else
+            echo "🟢 Using cached symbol DB (entries: $(jq 'keys|length' .cache/symbol_db.json))"
+          fi
+
+      - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
         env:
           SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
           SLACK_WEBHOOK_MEDICAL: ${{ secrets.SLACK_WEBHOOK_MEDICAL }}
@@ -53,9 +119,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ---------- Safe helpers (no brittle pipes) ----------
-          safe_json_has_quotes() { jq -e '.quotes | length >= 1' <<<"$1" >/dev/null 2>&1; }
-          safe_json_is_valid()   { jq -e . <<<"$1" >/dev/null 2>&1; }
+          # ---------- Helpers ----------
           safe_xpath() { xmllint --xpath "string($2)" "$1" 2>/dev/null || true; }
 
           FEEDS=(
@@ -73,12 +137,6 @@ jobs:
 
           PER_FEED_ITEMS=3
           WINDOW_SEC=600
-          NEG_TTL_DAYS=30
-          NEG_TTL_SEC=$((NEG_TTL_DAYS * 24 * 3600))
-
-          # Yahoo headers
-          YF_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          YF_LANG='en-US,en;q=0.9'
 
           CURRENT_TIME=$(date -u +%s)
           TEN_MINUTES_AGO=$((CURRENT_TIME - WINDOW_SEC))
@@ -89,7 +147,6 @@ jobs:
           }' .cache/last_10min_articles.txt > .cache/_pruned.tmp || true
           mv .cache/_pruned.tmp .cache/last_10min_articles.txt
 
-          # ---------- Extractor helpers ----------
           norm_company_name() {
             echo "$1" \
               | sed 's/[™®©]//g' \
@@ -101,136 +158,44 @@ jobs:
           }
 
           extract_candidates() {
-            # prints 1 or 2 lines: primary company, and optional secondary (for "X and Y Announce …")
             local title="$1"
-
             local pre; pre=$(echo "$title" | sed -E 's/ — / - /g' | awk -F' - |:|\\|\\|' '{print $1}')
             [ -z "$pre" ] && pre="$title"
             pre=$(echo "$pre" | sed 's/[“”"()™®©]//g' | tr -s ' ')
-
             local first; first=$(awk '{print $1}' <<<"$pre")
-            if echo "$first" | grep -qE '^[A-Z0-9\-]{2,}$'; then
-              echo "$first"
-              return 0
-            fi
-
+            if echo "$first" | grep -qE '^[A-Z0-9\-]{2,}$'; then echo "$first"; return 0; fi
             VERBS='announces|announce|launches|launch|reports|report|unveils|introduces|reveals|confirms|completes|signs|wins|awarded|enters|partners|acquires|files|prices|lists|successfully|passes|secures|appoints|names|extends|expands|approves|approved'
-            GENERIC='inverters|series|platform|solution|solutions|product|products|system|systems|software|hardware|services|technology|technologies|network|appliance|appliances|device|devices|trial|results'
-
-            awk -v verbs="$VERBS" -v gener="$GENERIC" '
-              function tolow(s){ out=s; gsub(/[[:punct:]]/,"",out); return tolower(out) }
-              BEGIN{ split(verbs,v,"|"); for(i in v) V[v[i]]=1;
-                     split(gener,g,"|"); for(i in g) G[g[i]]=1; }
-              {
-                n=NF; primary=""; secondary=""; seen_and=0;
-                for(i=1;i<=n;i++){
-                  wl=tolow($i)
-                  if (wl in V) break
-                  if (wl=="and"){
-                    if (length(primary)>0){ seen_and=1; next }
-                  }
-                  is_caps=($i ~ /^[A-Z][A-Za-z0-9.-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/)
-                  if (is_caps){
-                    if (seen_and==0){
-                      primary = (length(primary)? primary" ":"") $i
-                    } else {
-                      secondary = (length(secondary)? secondary" ":"") $i
-                    }
-                  } else {
-                    if (length(primary)>0 && seen_and==0) { break }
-                    if (length(secondary)>0 && seen_and==1) { break }
-                  }
-                }
-                split(primary, p, " ")
-                if (length(p)>1 && (tolow(p[length(p)]) in G)) { p[length(p)]=""; primary=""; for(k in p) if(p[k]!="") primary=(length(primary)?primary" ":"") p[k] }
-                print primary
-                if (length(secondary)>0) print secondary
-              }' <<<"$pre"
+            awk -v verbs="$VERBS" 'function tolow(s){ out=s; gsub(/[[:punct:]]/,"",out); return tolower(out) }
+              BEGIN{ split(verbs,v,"|"); for(i in v) V[v[i]]=1; }
+              { n=NF; chunk="";
+                for(i=1;i<=n;i++){ wl=tolow($i); if (wl in V) break; if ($i ~ /^[A-Z][A-Za-z0-9.-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){ chunk = (length(chunk)?chunk" ":"") $i } else if (length(chunk)>0) break }
+                print chunk }' <<<"$pre"
           }
 
-          # ---------- Yahoo resolver (AUTOC first, then search) ----------
-          lookup_company_exchange() {
+          resolve_company_local() {
+            # returns JSON {"ticker": "...", "exchange": "..."} or {"ticker":null}
             local raw="$1"
-            local key norm entry cached_ticker last_checked last_epoch age
-            norm=$(norm_company_name "$raw")
-            key="$norm"
-
-            local now_epoch
-            now_epoch=$(date -u +%s)
-
-            # 1) Inventory check (with TTL for negative)
-            if jq -e --arg k "$key" 'has($k)' .cache/company_index.json >/dev/null; then
-              entry=$(jq -r --arg k "$key" '.[$k]' .cache/company_index.json)
-              cached_ticker=$(jq -r '.ticker' <<<"$entry")
-              last_checked=$(jq -r '.last_checked' <<<"$entry")
-              last_epoch=$(date -u -d "$last_checked" +%s 2>/dev/null || echo 0)
-              if [ "$cached_ticker" != "null" ] && [ -n "$cached_ticker" ]; then
-                echo "$entry"; return 0
+            local key=$(norm_company_name "$raw")
+            local hit
+            hit=$(jq -cr --arg k "$key" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
+            if [ "$hit" != "null" ] && [ -n "$hit" ]; then
+              echo "$hit"; return 0
+            fi
+            # Try progressive shortening (drop last token)
+            local words=($key)
+            while [ ${#words[@]} -gt 1 ]; do
+              unset 'words[${#words[@]}-1]'
+              k2="${words[*]}"
+              k2=$(echo "$k2" | sed -E 's/ +/ /g')
+              hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
+              if [ "$hit" != "null" ] && [ -n "$hit" ]; then
+                echo "$hit"; return 0
               fi
-              age=$(( now_epoch - last_epoch ))
-              if [ "$last_epoch" -gt 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then
-                echo "$entry"; return 0
-              fi
-            fi
-
-            # 2) Yahoo AUTOC (more reliable)
-            local q j ok symbol exchDisp
-            q=$(printf '%s' "$raw" | sed 's/ /%20/g')
-            ok=false; symbol=""; exchDisp=""; j=""
-
-            j=$(curl -sSL --max-time 8 \
-                  -H "User-Agent: $YF_UA" -H "Accept-Language: $YF_LANG" \
-                  "https://autoc.finance.yahoo.com/autoc?query=$q&region=US&lang=en-US" || true)
-            safe_json_is_valid "$j" || j=""
-
-            if [ -n "$j" ]; then
-              lines_json=$(jq -cr '.ResultSet.Result[]? | select(.type=="S") | {symbol,exchDisp}' <<<"$j" 2>/dev/null || true)
-              while IFS= read -r line; do
-                [ -z "$line" ] && continue
-                symbol=$(jq -r '.symbol' <<<"$line")
-                exchDisp=$(jq -r '.exchDisp' <<<"$line")
-                if echo "$exchDisp" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
-                  ok=true; break
-                fi
-              done <<<"$lines_json"
-            fi
-
-            # 3) Fallback to old search if AUTOC failed
-            if [ "$ok" != true ]; then
-              j=$(curl -sSL --max-time 8 \
-                    -H "User-Agent: $YF_UA" -H "Accept-Language: $YF_LANG" \
-                    "https://query1.finance.yahoo.com/v1/finance/search?q=$q&quotesCount=5&newsCount=0" || true)
-              safe_json_is_valid "$j" || j=""
-              if [ -n "$j" ]; then
-                lines_json=$(jq -cr '.quotes[]? | select(.quoteType=="EQUITY") | {symbol:.symbol,exchDisp:.exchDisp}' <<<"$j" 2>/dev/null || true)
-                while IFS= read -r line; do
-                  [ -z "$line" ] && continue
-                  symbol=$(jq -r '.symbol' <<<"$line")
-                  exchDisp=$(jq -r '.exchDisp' <<<"$line")
-                  if echo "$exchDisp" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
-                    ok=true; break
-                  fi
-                done <<<"$lines_json"
-              fi
-            fi
-
-            # 4) Write result (positive or negative) to inventory
-            if [ "$ok" = true ]; then
-              tmp=$(mktemp)
-              jq --arg k "$key" --arg sym "$symbol" --arg exd "$exchDisp" --arg t "$(date -u +%FT%TZ)" \
-                 '.[$k] = {ticker:$sym, exchange:$exd, last_checked:$t}' \
-                 .cache/company_index.json > "$tmp" && mv "$tmp" .cache/company_index.json
-              echo "{\"ticker\":\"$symbol\",\"exchange\":\"$exchDisp\"}"
-            else
-              tmp=$(mktemp)
-              jq --arg k "$key" --arg t "$(date -u +%FT%TZ)" \
-                 '.[$k] = {ticker:null, exchange:null, last_checked:$t}' \
-                 .cache/company_index.json > "$tmp" && mv "$tmp" .cache/company_index.json
-              echo '{"ticker":null,"exchange":null}'
-            fi
-            return 0
+            done
+            echo '{"ticker":null,"exchange":null}'
           }
 
+          # ---------- MAIN LOOP ----------
           NEW_ARTICLE_FOUND=false
 
           for FEED_URL in "${FEEDS[@]}"; do
@@ -281,30 +246,21 @@ jobs:
                 continue
               fi
 
-              # --- US-listing filter for PR Newswire ONLY (via inventory+lookup)
+              # --- US-listing filter for PR Newswire ONLY (local DB) ---
               if [ "$FEED_URL" = "$PRN_FEED" ]; then
-                # Extract one or two candidate company names
-                mapfile -t CANDS < <(extract_candidates "$TITLE" | sed -E 's/^ +| +$//g' | sed '/^$/d')
-                PRN_US_OK=false
-                PRN_EXCH=""
-                PRN_TICKER=""
-                for cand in "${CANDS[@]:-}"; do
-                  info_json=$(lookup_company_exchange "$cand")
-                  exch=$(jq -r '.exchange // empty' <<<"$info_json")
-                  ticker=$(jq -r '.ticker // empty' <<<"$info_json")
-                  if echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
-                    PRN_US_OK=true
-                    PRN_EXCH="$exch"
-                    PRN_TICKER="$ticker"
-                    break
-                  fi
-                done
-
-                if [ "$PRN_US_OK" != true ]; then
-                  echo "🇺🇸⛔ Skipping PRN item not resolved to US exchange: $TITLE (candidates tried: ${CANDS[*]:-none})"
+                cand=$(extract_candidates "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
+                if [ -z "$cand" ]; then
+                  echo "🇺🇸⛔ Skipping PRN (no company candidate): $TITLE"
                   continue
                 fi
-                echo "🇺🇸✅ PRN item resolved to US exchange: $TITLE (ticker: ${PRN_TICKER:-N/A}, exchange: $PRN_EXCH)"
+                info_json=$(resolve_company_local "$cand")
+                exch=$(jq -r '.exchange // empty' <<<"$info_json")
+                ticker=$(jq -r '.ticker // empty' <<<"$info_json")
+                if ! echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
+                  echo "🇺🇸⛔ Skipping PRN (not US-listed or unresolved): $TITLE (cand: $cand)"
+                  continue
+                fi
+                echo "🇺🇸✅ PRN US-listed: $TITLE (cand: $cand, $ticker / $exch)"
               fi
 
               # Categorize
@@ -367,22 +323,28 @@ jobs:
             echo "✅ No new articles in the last 10 minutes."
           fi
 
-      # ===== Manual PRN-style headlines test (extractor + Yahoo AUTOC) =====
-      - name: Manual headline extractor + Yahoo lookup test (improved)
+      # ===== Manual PRN-style headline test against local symbol DB =====
+      - name: Manual headline extractor + local DB lookup test
         run: |
           set -euo pipefail
 
-          YF_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          YF_LANG='en-US,en;q=0.9'
-          safe_json_is_valid()   { jq -e . <<<"$1" >/dev/null 2>&1; }
+          norm_company_name() {
+            echo "$1" \
+              | sed 's/[™®©]//g' \
+              | sed 's/[“”"'\''()]//g' \
+              | sed 's/&/ and /g' \
+              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
+              | sed -E 's/ +/ /g; s/^ +| +$//g' \
+              | tr '[:upper:]' '[:lower:]'
+          }
 
-          extract_candidates() { # same as above (minimal inline)
+          extract_candidates() {
             local title="$1"
             local pre; pre=$(echo "$title" | sed -E 's/ — / - /g' | awk -F' - |:|\\|\\|' '{print $1}')
             [ -z "$pre" ] && pre="$title"
             pre=$(echo "$pre" | sed 's/[“”"()™®©]//g' | tr -s ' ')
             local first; first=$(awk '{print $1}' <<<"$pre")
-            if echo "$first" | grep -qE '^[A-Z0-9\-]{2,}$'; then echo "$first"; return; fi
+            if echo "$first" | grep -qE '^[A-Z0-9\-]{2,}$'; then echo "$first"; return 0; fi
             VERBS='announces|announce|launches|launch|reports|report|unveils|introduces|reveals|confirms|completes|signs|wins|awarded|enters|partners|acquires|files|prices|lists|successfully|passes|secures|appoints|names|extends|expands|approves|approved'
             awk -v verbs="$VERBS" 'function tolow(s){ out=s; gsub(/[[:punct:]]/,"",out); return tolower(out) }
               BEGIN{ split(verbs,v,"|"); for(i in v) V[v[i]]=1; }
@@ -391,27 +353,23 @@ jobs:
                 print chunk }' <<<"$pre"
           }
 
-          lookup_autoc() {
+          resolve_company_local() {
             local raw="$1"
-            local q=$(printf '%s' "$raw" | sed 's/ /%20/g')
-            echo "🔎 Lookup: $raw"
-            j=$(curl -sSL --max-time 8 -H "User-Agent: $YF_UA" -H "Accept-Language: $YF_LANG" \
-                "https://autoc.finance.yahoo.com/autoc?query=$q&region=US&lang=en-US" || true)
-            safe_json_is_valid "$j" || j=""
-            if [ -n "$j" ]; then
-              hits=$(jq -cr '[.ResultSet.Result[]? | select(.type=="S")][0:5]' <<<"$j" 2>/dev/null || echo "[]")
-              if [ "$hits" != "[]" ]; then
-                echo "$hits" | jq -cr '.[] | "\(.symbol) / \(.exchDisp) — \(.name // .symbol)"'
-              else
-                echo "❌ No match"
-              fi
-            else
-              echo "❌ No match"
-            fi
-            echo "---------------------------------"
+            local key=$(norm_company_name "$raw")
+            local hit
+            hit=$(jq -cr --arg k "$key" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
+            if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
+            local words=($key)
+            while [ ${#words[@]} -gt 1 ]; do
+              unset 'words[${#words[@]}-1]'
+              k2="${words[*]}"; k2=$(echo "$k2" | sed -E 's/ +/ /g')
+              hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
+              if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
+            done
+            echo '{"ticker":null,"exchange":null}'
           }
 
-          echo "📰 Testing improved extractor + Yahoo AUTOC on PRN-style headlines…"
+          echo "📰 Testing extractor + local DB…"
           HEADLINES=(
             "AEWIN Launches SCB-1953 Series High-Performance Network Appliances Powered by Intel Xeon 6 Processors"
             "Sungrow Inverters Successfully Pass the Brazilian Grid Operator Validations"
@@ -424,13 +382,19 @@ jobs:
           )
 
           for H in "${HEADLINES[@]}"; do
-            echo "📰 $H"
             cand=$(extract_candidates "$H" | sed -E 's/^ +| +$//g' | head -n1)
-            if [ -z "$cand" ]; then
-              echo "   → (no candidate extracted)"; echo "---------------------------------"; continue
+            echo "📰 $H"
+            echo "   → Candidate: ${cand:-<none>}"
+            if [ -z "${cand:-}" ]; then echo "   → ❌ no candidate"; echo "---------------------------------"; continue; fi
+            info_json=$(resolve_company_local "$cand")
+            exch=$(jq -r '.exchange // empty' <<<"$info_json")
+            ticker=$(jq -r '.ticker // empty' <<<"$info_json")
+            if [ -n "$ticker" ] && echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
+              echo "   → ✅ $ticker / $exch"
+            else
+              echo "   → ❌ not US-listed or unresolved"
             fi
-            echo "   → Candidate: $cand"
-            lookup_autoc "$cand"
+            echo "---------------------------------"
           done
 
       # ===== Inventory inspection & publishing =====
@@ -439,20 +403,11 @@ jobs:
           if [ ! -f .cache/company_index.json ]; then
             echo "No inventory file yet."; exit 0;
           fi
-
           echo "📦 company_index.json"
           ls -lh .cache/company_index.json
-
           echo "Total entries:"
           jq 'keys | length' .cache/company_index.json
-
-          echo "Positive entries (have ticker/exchange):"
-          jq '[ to_entries[] | select(.value.ticker != null and .value.exchange != null) ] | length' .cache/company_index.json
-
-          echo "Negative entries (null ticker/exchange):"
-          jq '[ to_entries[] | select(.value.ticker == null or .value.exchange == null) ] | length' .cache/company_index.json
-
-          echo "Sample positives (first 10):"
+          echo "Sample (first 10 positives):"
           jq -r '[ to_entries[] | select(.value.ticker != null) ][0:10]' .cache/company_index.json
 
       - name: Inventory summary (Job Summary)
