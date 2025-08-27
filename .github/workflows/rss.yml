@@ -14,13 +14,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Environment
       - name: Set up environment
         run: |
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq curl coreutils
 
-      # 2) Restore/prime cross-run cache (mutable state for dedupe + inventory)
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -29,7 +27,6 @@ jobs:
           restore-keys: |
             rss-cache-${{ runner.os }}-
 
-      # 3) Ensure cache files exist
       - name: Create cache files if not exists
         run: |
           mkdir -p .cache
@@ -37,7 +34,6 @@ jobs:
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
 
-      # 3a) (Optional) Sanity-check Yahoo endpoint (logs only; non-blocking)
       - name: Sanity-check Yahoo search endpoint
         run: |
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
@@ -46,7 +42,6 @@ jobs:
             "https://query1.finance.yahoo.com/v1/finance/search?q=Apple&quotesCount=2&newsCount=0" \
             | jq '.quotes[0] | {symbol,exchDisp}' || true
 
-      # 4) Parse feeds, categorize, dedupe, PRN exchange-filter via inventory, and send to Slack
       - name: Parse RSS Feeds and Post to Slack
         env:
           SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
@@ -54,6 +49,11 @@ jobs:
           SLACK_WEBHOOK_CONTRACTS: ${{ secrets.SLACK_WEBHOOK_CONTRACTS }}
         run: |
           set -euo pipefail
+
+          # ---------- Safe helpers (no brittle pipes) ----------
+          safe_json_has_quotes() { jq -e '.quotes | length >= 1' <<<"$1" >/dev/null 2>&1; }
+          safe_json_is_valid()   { jq -e . <<<"$1" >/dev/null 2>&1; }
+          safe_xpath() { xmllint --xpath "string($2)" "$1" 2>/dev/null || true; }
 
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
@@ -70,27 +70,22 @@ jobs:
 
           PER_FEED_ITEMS=3
           WINDOW_SEC=600
-
-          # Negative-cache TTL (days) for company lookups that didn't resolve to US exchanges
           NEG_TTL_DAYS=30
           NEG_TTL_SEC=$((NEG_TTL_DAYS * 24 * 3600))
 
-          # Yahoo reliability hardening
           YF_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
           YF_LANG='en-US,en;q=0.9'
 
           CURRENT_TIME=$(date -u +%s)
           TEN_MINUTES_AGO=$((CURRENT_TIME - WINDOW_SEC))
 
-          # --- prune rolling 10-min headline cache (format: "<epoch> <headline_hash>")
+          # Prune rolling 10-min headline cache (format: "<epoch> <headline_hash>")
           awk -v cutoff="$TEN_MINUTES_AGO" '{
             if (NF >= 2) { epoch=$1; if (epoch ~ /^[0-9]+$/ && epoch >= cutoff) print $0; }
           }' .cache/last_10min_articles.txt > .cache/_pruned.tmp || true
           mv .cache/_pruned.tmp .cache/last_10min_articles.txt
 
-          # ---------- Helpers ----------
           norm_company_name() {
-            # Normalize & strip common suffixes/symbols
             echo "$1" \
               | sed 's/[™®©]//g' \
               | sed 's/[“”"'\''()]//g' \
@@ -102,129 +97,104 @@ jobs:
 
           extract_company_from_title() {
             local t="$1"
+            local pre first cleaned
 
-            # 1) Prefer the part before common separators
-            local pre
             pre=$(echo "$t" | sed -E 's/ — / - /g' | awk -F' - |:|\\|\\|' '{print $1}')
             [ -z "$pre" ] && pre="$t"
-
-            # Keep spacing, keep case for heuristics
             pre=$(echo "$pre" | tr -s ' ')
-
-            # If the very first token is ALL CAPS (e.g., AEWIN), treat that as company
-            local first
             first=$(echo "$pre" | awk '{print $1}')
             if echo "$first" | grep -qE '^[A-Z0-9\-]{2,}$'; then
-              echo "$first"
-              return 0
+              echo "$first"; return 0
             fi
 
-            # Remove a leading verb as the second token (e.g., "Company announces ...")
             local VERBS='launches|announces|reports|unveils|introduces|reveals|confirms|completes|signs|wins|awarded|enters|partners|acquires|files|prices|lists|successfully|passes|secures|appoints|names|extends|expands'
-            local cleaned
             cleaned=$(echo "$pre" | awk -v verbs="$VERBS" '{
               if (NF>=2) {
                 second=$2
                 cmd="echo \"" second "\" | tr \"[:upper:]\" \"[:lower:]\""
                 cmd | getline second_lc; close(cmd)
-                if (second_lc ~ "^(" verbs ")$") {
-                  $2=""; sub(/^  +/,""); gsub(/  +/," ");
-                }
+                if (second_lc ~ "^(" verbs ")$") { $2=""; sub(/^  +/,""); gsub(/  +/," "); }
               }
               print
             }')
 
-            # Drop common product nouns if they immediately follow the company name
             local GENERIC_NOUNS='inverters|series|platform|solution|solutions|product|products|system|systems|software|hardware|services|technology|technologies|network|appliance|appliances|device|devices'
             cleaned=$(echo "$cleaned" | sed -E "s/\\b($GENERIC_NOUNS)\\b( |$)//I")
-
-            # Limit to first 6 words
             cleaned=$(echo "$cleaned" | awk '{for(i=1;i<=NF && i<=6;i++) printf (i==1?$i:" "$i); print ""}')
             cleaned=$(echo "$cleaned" | sed -E 's/^ +| +$//g')
-
             [ -z "$cleaned" ] && cleaned="$first"
             echo "$cleaned"
           }
 
           lookup_company_exchange() {
-            # $1: raw company guess (from title)
             local raw="$1"
-            local key norm
+            local key norm entry cached_ticker cached_exchange last_checked last_epoch age
             norm=$(norm_company_name "$raw")
             key="$norm"
 
             local now_epoch
             now_epoch=$(date -u +%s)
 
-            # 1) Inventory check (with TTL for negative entries)
+            # Inventory check (TTL for negative)
             if jq -e --arg k "$key" 'has($k)' .cache/company_index.json >/dev/null; then
               entry=$(jq -r --arg k "$key" '.[$k]' .cache/company_index.json)
-              cached_ticker=$(echo "$entry" | jq -r '.ticker')
-              cached_exchange=$(echo "$entry" | jq -r '.exchange')
-              last_checked=$(echo "$entry" | jq -r '.last_checked')
+              cached_ticker=$(jq -r '.ticker' <<<"$entry")
+              cached_exchange=$(jq -r '.exchange' <<<"$entry")
+              last_checked=$(jq -r '.last_checked' <<<"$entry")
               last_epoch=$(date -u -d "$last_checked" +%s 2>/dev/null || echo 0)
 
-              if [ "$cached_ticker" != "null" ] && [ -n "$cached_ticker" ] && [ "$cached_ticker" != "" ]; then
-                echo "$entry"
-                return 0
+              if [ "$cached_ticker" != "null" ] && [ -n "$cached_ticker" ]; then
+                echo "$entry"; return 0
               fi
 
-              # negative/unknown: honor TTL
               age=$(( now_epoch - last_epoch ))
               if [ "$last_epoch" -gt 0 ] && [ "$age" -lt "$NEG_TTL_SEC" ]; then
-                echo "$entry"
-                return 0
+                echo "$entry"; return 0
               fi
             fi
 
-            # 2) Remote search (Yahoo Finance) — add UA, retry/backoff, fallback
-            local q url j ok symbol exchDisp
+            # Yahoo search with UA + retry/backoff, then fallback
+            local q j ok symbol exchDisp
             q=$(printf '%s' "$raw" | sed 's/ /%20/g')
+            ok=false; symbol=""; exchDisp=""; j=""
 
-            # primary search with retries
-            max_tries=3
-            sleep_s=1
-            j=""
+            max_tries=3; sleep_s=1
             for try in $(seq 1 $max_tries); do
               j=$(curl -sL --max-time 8 \
                     -H "User-Agent: $YF_UA" \
                     -H "Accept-Language: $YF_LANG" \
                     "https://query1.finance.yahoo.com/v1/finance/search?q=$q&quotesCount=5&newsCount=0" || true)
-              if echo "$j" | jq -e '.quotes | length >= 1' >/dev/null 2>&1; then
+              safe_json_is_valid "$j" || j=""
+              if [ -n "$j" ] && safe_json_has_quotes "$j"; then
                 break
               fi
               sleep "$sleep_s"; sleep_s=$(( sleep_s * 2 ))
             done
 
-            # fallback lookup if primary was empty/flaky
-            if ! echo "$j" | jq -e '.quotes | length >= 1' >/dev/null 2>&1; then
+            if [ -z "$j" ] || ! safe_json_has_quotes "$j"; then
               j=$(curl -sL --max-time 8 \
                     -H "User-Agent: $YF_UA" \
                     -H "Accept-Language: $YF_LANG" \
                     "https://query1.finance.yahoo.com/v1/finance/lookup?formatted=true&lang=en-US&region=US&query=$q&type=equity&count=5" || true)
+              safe_json_is_valid "$j" || j=""
             fi
 
-            ok=false
-            symbol=""
-            exchDisp=""
-
             if [ -n "$j" ]; then
-              mapfile -t lines < <(echo "$j" | jq -cr '.quotes[]? | select(.quoteType=="EQUITY") | {symbol:.symbol, exchDisp:.exchDisp}')
-              for line in "${lines[@]:-}"; do
-                symbol=$(echo "$line" | jq -r '.symbol')
-                exchDisp=$(echo "$line" | jq -r '.exchDisp')
+              lines_json=$(jq -cr '.quotes[]? | select(.quoteType=="EQUITY") | {symbol:.symbol,exchDisp:.exchDisp} | @base64' <<<"$j" 2>/dev/null || true)
+              while IFS= read -r b64; do
+                [ -z "$b64" ] && continue
+                line=$(echo "$b64" | base64 -d)
+                symbol=$(jq -r '.symbol' <<<"$line")
+                exchDisp=$(jq -r '.exchDisp' <<<"$line")
                 if echo "$exchDisp" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
                   ok=true; break
                 fi
-              done
+              done <<<"$lines_json"
             fi
 
             if [ "$ok" = true ]; then
               tmp=$(mktemp)
-              jq --arg k "$key" \
-                 --arg sym "$symbol" \
-                 --arg exd "$exchDisp" \
-                 --arg t "$(date -u +%FT%TZ)" \
+              jq --arg k "$key" --arg sym "$symbol" --arg exd "$exchDisp" --arg t "$(date -u +%FT%TZ)" \
                  '.[$k] = {ticker:$sym, exchange:$exd, last_checked:$t}' \
                  .cache/company_index.json > "$tmp" && mv "$tmp" .cache/company_index.json
               echo "{\"ticker\":\"$symbol\",\"exchange\":\"$exchDisp\"}"
@@ -243,22 +213,20 @@ jobs:
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
-            XML=$(curl -sL "$FEED_URL" || true)
-            [ -z "$XML" ] && { echo "⚠️  Empty response from feed."; continue; }
+
+            XML_FILE=$(mktemp)
+            curl -sL "$FEED_URL" > "$XML_FILE" || true
+            if [ ! -s "$XML_FILE" ]; then
+              echo "⚠️  Empty response from feed."
+              rm -f "$XML_FILE"
+              continue
+            fi
 
             for i in $(seq 1 "$PER_FEED_ITEMS"); do
-              LINK=$(
-                echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href)" - 2>/dev/null
-              )
-              TITLE=$(
-                echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/title)" - 2>/dev/null
-              )
-              DESCRIPTION=$(
-                echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/description | //entry[$i]/summary)" - 2>/dev/null
-              )
-              PUBDATE=$(
-                echo "$XML" | xmllint --xpath "string((//item|//entry)[$i]/pubDate | //entry[$i]/updated)" - 2>/dev/null
-              )
+              LINK=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href")
+              TITLE=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/title")
+              DESCRIPTION=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/description | //entry[$i]/summary")
+              PUBDATE=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/pubDate | //entry[$i]/updated")
 
               [ -z "$LINK" ] && continue
               [ -z "$TITLE" ] && TITLE="(No Title)"
@@ -269,21 +237,18 @@ jobs:
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
-              # Robust date parsing
               ARTICLE_TIME=$(date -d "$PUBDATE" +%s 2>/dev/null || echo 0)
               if [ "$ARTICLE_TIME" -eq 0 ] || [ "$ARTICLE_TIME" -lt "$TEN_MINUTES_AGO" ]; then
                 echo "⏱️ Skipping (invalid/old date): $TITLE"
                 continue
               fi
 
-              # Short-term dedupe (10-min window) — by headline hash
               HEADLINE_HASH=$(echo -n "$TITLE" | md5sum | cut -d ' ' -f1)
-              if awk '{print $2}' .cache/last_10min_articles.txt | grep -qx "$HEADLINE_HASH"; then
+              if grep -qx "$HEADLINE_HASH" <(awk '{print $2}' .cache/last_10min_articles.txt); then
                 echo "🔁 Skipping duplicate headline (10-min window): $TITLE"
                 continue
               fi
 
-              # Global dedupe across runs — by link hash and headline hash
               LINK_HASH=$(echo -n "$LINK" | md5sum | cut -d ' ' -f1)
               if grep -qx "$LINK_HASH" .cache/sent_hashes.txt; then
                 echo "🧭 Already sent (by link): $TITLE"
@@ -294,13 +259,11 @@ jobs:
                 continue
               fi
 
-              # --- US-listing filter for PR Newswire ONLY (via inventory+lookup)
               if [ "$FEED_URL" = "$PRN_FEED" ]; then
                 company_guess=$(extract_company_from_title "$TITLE")
                 info_json=$(lookup_company_exchange "$company_guess")
-                exch=$(echo "$info_json" | jq -r '.exchange // empty')
-                ticker=$(echo "$info_json" | jq -r '.ticker // empty')
-
+                exch=$(jq -r '.exchange // empty' <<<"$info_json")
+                ticker=$(jq -r '.ticker // empty' <<<"$info_json")
                 if ! echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
                   echo "🇺🇸⛔ Skipping PRN item not resolved to US exchange: $TITLE (company: $company_guess, exchange: ${exch:-unknown})"
                   continue
@@ -308,7 +271,6 @@ jobs:
                 echo "🇺🇸✅ PRN item resolved to US exchange: $TITLE (company: $company_guess, exchange: $exch, ticker: ${ticker:-N/A})"
               fi
 
-              # Categorize
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
                 CATEGORY="medical"
               elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
@@ -317,7 +279,6 @@ jobs:
                 CATEGORY="general"
               fi
 
-              # Sentiment + naive recommendation
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT=":large_green_circle: [POSITIVE]"
                 RECOMMENDATION="BUY"
@@ -354,13 +315,14 @@ jobs:
                 -H 'Content-type: application/json' \
                 --data "$PAYLOAD" >/dev/null || true
 
-              # Mark dedupe: global and 10-min caches
               echo "$LINK_HASH" >> .cache/sent_hashes.txt
               echo "$HEADLINE_HASH" >> .cache/sent_hashes.txt
               echo "$CURRENT_TIME $HEADLINE_HASH" >> .cache/last_10min_articles.txt
 
               NEW_ARTICLE_FOUND=true
             done
+
+            rm -f "$XML_FILE"
           done
 
           if [ "$NEW_ARTICLE_FOUND" = false ]; then
