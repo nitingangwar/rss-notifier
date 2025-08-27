@@ -19,6 +19,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq curl coreutils
 
+      # Cross-run cache for dedupe + inventory
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -328,3 +329,49 @@ jobs:
           if [ "$NEW_ARTICLE_FOUND" = false ]; then
             echo "✅ No new articles in the last 10 minutes."
           fi
+
+      # ===== Inventory inspection & publishing =====
+
+      - name: Inspect company inventory (summary)
+        run: |
+          if [ ! -f .cache/company_index.json ]; then
+            echo "No inventory file yet."; exit 0;
+          fi
+
+          echo "📦 company_index.json"
+          ls -lh .cache/company_index.json
+
+          echo "Total entries:"
+          jq 'keys | length' .cache/company_index.json
+
+          echo "Positive entries (have ticker/exchange):"
+          jq '[ to_entries[] | select(.value.ticker != null and .value.exchange != null) ] | length' .cache/company_index.json
+
+          echo "Negative entries (null ticker/exchange):"
+          jq '[ to_entries[] | select(.value.ticker == null or .value.exchange == null) ] | length' .cache/company_index.json
+
+          echo "Sample positives (first 10):"
+          jq -r '[ to_entries[] | select(.value.ticker != null) ][0:10]' .cache/company_index.json
+
+      - name: Inventory summary (Job Summary)
+        run: |
+          if [ ! -f .cache/company_index.json ]; then
+            echo "No inventory yet" >> "$GITHUB_STEP_SUMMARY"; exit 0;
+          fi
+          POS=$(jq '[ to_entries[] | select(.value.ticker != null and .value.exchange != null) ] | length' .cache/company_index.json)
+          NEG=$(jq '[ to_entries[] | select(.value.ticker == null or .value.exchange == null) ] | length' .cache/company_index.json)
+          {
+            echo "### Company Inventory Summary"
+            echo ""
+            echo "| Metric | Count |"
+            echo "|---|---:|"
+            echo "| Positives (ticker found) | $POS |"
+            echo "| Negatives (no match) | $NEG |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish company inventory (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: company-index
+          path: .cache/company_index.json
