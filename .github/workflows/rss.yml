@@ -40,6 +40,10 @@ jobs:
           [ -f .cache/symbols.sha256 ]   || : > .cache/symbols.sha256
           [ -f .cache/negative_prn.json ] || echo '{}' > .cache/negative_prn.json
 
+      - name: Reset negative cache (one-time fix)
+        run: |
+          echo '{}' > .cache/negative_prn.json
+
       # Build key→ticker map from your TAB-separated data/symbols.csv (uses 1–4 word prefixes)
       - name: Build symbol lookup (rebuild only if TSV changed)
         shell: bash
