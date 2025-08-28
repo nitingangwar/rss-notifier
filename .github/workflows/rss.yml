@@ -36,7 +36,7 @@ jobs:
           [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      - name: Build/refresh US symbol database (robust: Nasdaq → SEC → seed)
+      - name: Build/refresh US symbol database
         shell: bash
         run: |
           set -euo pipefail
