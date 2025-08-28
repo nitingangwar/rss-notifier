@@ -1,4 +1,4 @@
-name: Categorized RSS Alerts with Sentiment (Local Symbols)
+name: Categorized RSS Alerts with Sentiment (Local TSV)
 
 on:
   workflow_dispatch: {}
@@ -17,13 +17,11 @@ jobs:
       - name: Set up environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxml2-utils w3m jq curl coreutils gawk miller
+          sudo apt-get install -y libxml2-utils w3m jq curl coreutils
 
-      # Pull repo contents (so we can read data/symbols.csv)
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Cache dedupe & the derived symbol DB
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -35,26 +33,34 @@ jobs:
       - name: Ensure cache files
         run: |
           mkdir -p .cache
-          [ -f .cache/sent_hashes.txt ] || touch .cache/sent_hashes.txt
-          [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
+          [ -f .cache/sent_hashes.txt ] || : > .cache/sent_hashes.txt
+          [ -f .cache/last_10min_articles.txt ] || : > .cache/last_10min_articles.txt
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
+          [ -f .cache/symbols.sha256 ]   || : > .cache/symbols.sha256
 
-  
-      - name: Build symbol database from local TSV (bash+jq, no pipes into functions)
+      # ======= Build (or reuse) a fast lookup from your TAB-separated file =======
+      - name: Build symbol lookup (only if TSV changed)
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .cache
-      
-          INPUT_FILE="data/symbols.csv"   # tab-separated file (your pasted table)
+          INPUT_FILE="data/symbols.csv"   # your TAB-separated file
           if [ ! -f "$INPUT_FILE" ]; then
-            echo "❌ $INPUT_FILE not found."
+            echo "❌ Missing $INPUT_FILE — add it via GitHub UI (data/symbols.csv, tab-separated with header)."
             exit 1
           fi
-      
-          # Reset output
-          echo '{}' > .cache/symbol_db.json
-      
+
+          NEW_HASH="$(sha256sum "$INPUT_FILE" | awk '{print $1}')"
+          OLD_HASH="$(cat .cache/symbols.sha256 || true)"
+
+          if [ "$NEW_HASH" = "$OLD_HASH" ] && [ -s .cache/symbol_db.json ]; then
+            echo "🟢 symbols.csv unchanged; reusing existing lookup (keys: $(jq 'keys|length' .cache/symbol_db.json))"
+            exit 0
+          fi
+
+          echo "🔄 symbols.csv changed; rebuilding lookup…"
+          KT=/tmp/key_ticker.tsv
+          : > "$KT"
+
           norm() {
             # normalize a single string passed as $1
             local s="${1:-}"
@@ -68,52 +74,56 @@ jobs:
               | sed -E 's/ +/ /g; s/^ +| +$//g')"
             printf '%s' "$s"
           }
-      
-          # Read TSV line by line, skipping header
-          # We only need first 2 columns: Symbol, Name
+
+          # Read TAB-separated rows: Symbol<TAB>Name<…>
+          # Skip header (line 1). Only the first two columns are needed.
           tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name _; do
-            [ -z "${sym:-}" ] && continue
+            [ -z "${sym:-}" ]  && continue
             [ -z "${name:-}" ] && continue
-      
+
+            # main key: full normalized name
             key="$(norm "$name")"
-      
-            # First and first-two words (pure bash, no awk/pipes)
+            [ -n "$key" ] && printf '%s\t%s\n' "$key" "$sym" >> "$KT"
+
+            # alternates: first word, first two words
             # shellcheck disable=SC2206
-            words=($name)  # word split on spaces
-            w1="${words[0]:-}"
-            w2="${words[1]:-}"
-            alt1_raw="$w1"
-            [ -n "$w2" ] && alt1_raw="$w1 $w2"
-      
-            alt1="$(norm "$alt1_raw")"
-            alt2="$(norm "$w1")"
-      
-            for k in "$key" "$alt1" "$alt2"; do
-              [ -z "$k" ] && continue
-              tmp="$(mktemp)"
-              jq --arg k "$k" --arg t "$sym" \
-                 'if has($k) then . else .[$k] = {ticker:$t} end' \
-                 .cache/symbol_db.json > "$tmp" && mv "$tmp" .cache/symbol_db.json
-            done
+            words=($name)
+            w1="${words[0]:-}"; w2="${words[1]:-}"
+
+            if [ -n "$w1" ]; then
+              alt2="$(norm "$w1")"
+              [ -n "$alt2" ] && printf '%s\t%s\n' "$alt2" "$sym" >> "$KT"
+            fi
+            if [ -n "$w1" ] && [ -n "$w2" ]; then
+              alt1="$(norm "$w1 $w2")"
+              [ -n "$alt1" ] && printf '%s\t%s\n' "$alt1" "$sym" >> "$KT"
+            fi
           done
-      
-          echo "✅ Built symbol DB with $(jq 'keys|length' .cache/symbol_db.json) entries"
 
+          # Single jq reduce (first occurrence wins)
+          jq -Rs '
+            split("\n")
+            | map(select(length>0) | split("\t") | {k:.[0], t:.[1]})
+            | reduce .[] as $r ({}; if has($r.k) then . else .[$r.k] = {ticker:$r.t} end)
+          ' "$KT" > .cache/symbol_db.json
 
+          echo "$NEW_HASH" > .cache/symbols.sha256
+          echo "✅ Lookup built (keys: $(jq 'keys|length' .cache/symbol_db.json))"
 
-      # ===== Parse feeds + PRN filter (using your local symbol DB) =====
-      - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
+      # ======= Parse feeds and post to Slack (PRN filtered by local lookup) =======
+      - name: Parse RSS Feeds → Slack (PRN filtered by local US list)
         env:
           SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
           SLACK_WEBHOOK_MEDICAL: ${{ secrets.SLACK_WEBHOOK_MEDICAL }}
           SLACK_WEBHOOK_CONTRACTS: ${{ secrets.SLACK_WEBHOOK_CONTRACTS }}
+        shell: bash
         run: |
           set -euo pipefail
-          export LC_ALL=C
 
           # Helpers
           safe_xpath() { xmllint --xpath "string($2)" "$1" 2>/dev/null || true; }
 
+          # Feeds
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
@@ -129,7 +139,6 @@ jobs:
 
           PER_FEED_ITEMS=3
           WINDOW_SEC=600
-
           CURRENT_TIME=$(date -u +%s)
           TEN_MINUTES_AGO=$((CURRENT_TIME - WINDOW_SEC))
 
@@ -139,17 +148,19 @@ jobs:
           }' .cache/last_10min_articles.txt > .cache/_pruned.tmp || true
           mv .cache/_pruned.tmp .cache/last_10min_articles.txt
 
+          # normalization for query keys
           norm_company_name() {
             echo "$1" \
               | sed 's/[™®©]//g' \
               | sed 's/[“”"'\''()]//g' \
               | sed 's/&/ and /g' \
               | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/[^[:alnum:]_. -]/ /g' \
+              | sed -E 's/[^0-9A-Za-z_. -]/ /g' \
               | tr '[:upper:]' '[:lower:]' \
               | sed -E 's/ +/ /g; s/^ +| +$//g'
           }
 
+          # get candidate company from headline (left chunk up to verb / separator)
           extract_candidates() {
             local title="$1"
             local pre; pre=$(echo "$title" | sed -E 's/ — / - /g' | awk -F' - |:|\\|\\|' '{print $1}')
@@ -161,21 +172,28 @@ jobs:
             awk -v verbs="$VERBS" 'function tolow(s){ out=s; gsub(/[[:punct:]]/,"",out); return tolower(out) }
               BEGIN{ split(verbs,v,"|"); for(i in v) V[v[i]]=1; }
               { n=NF; chunk="";
-                for(i=1;i<=n;i++){ wl=tolow($i); if (wl in V) break; if ($i ~ /^[A-Z][A-Za-z0-9.-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){ chunk = (length(chunk)?chunk" ":"") $i } else if (length(chunk)>0) break }
+                for(i=1;i<=n;i++){
+                  wl=tolow($i);
+                  if (wl in V) break;
+                  if ($i ~ /^[A-Z][A-Za-z0-9.-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){ chunk = (length(chunk)?chunk" ":"") $i }
+                  else if (length(chunk)>0) break
+                }
                 print chunk }' <<<"$pre"
           }
 
+          # lookup in prebuilt JSON map with progressive shortening
           resolve_company_local() {
             local raw="$1"
             local key=$(norm_company_name "$raw")
             local hit
             hit=$(jq -cr --arg k "$key" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
             if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
-            # progressive shortening (drop last token)
+            # drop last token progressively
             local words=($key)
             while [ ${#words[@]} -gt 1 ]; do
               unset 'words[${#words[@]}-1]'
-              k2="${words[*]}"; k2=$(echo "$k2" | sed -E 's/ +/ /g')
+              local k2="${words[*]}"
+              k2=$(echo "$k2" | sed -E 's/ +/ /g')
               hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
               if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
             done
@@ -186,7 +204,6 @@ jobs:
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
-
             XML_FILE=$(mktemp)
             curl -sL "$FEED_URL" > "$XML_FILE" || true
             if [ ! -s "$XML_FILE" ]; then
@@ -232,7 +249,7 @@ jobs:
                 continue
               fi
 
-              # PR Newswire filter: require company match in local DB
+              # PR Newswire: only send if company matches local list
               if [ "$FEED_URL" = "$PRN_FEED" ]; then
                 cand=$(extract_candidates "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
                 if [ -z "$cand" ]; then
@@ -248,7 +265,7 @@ jobs:
                 echo "🇺🇸✅ PRN US-listed: $TITLE (cand: $cand, $ticker)"
               fi
 
-              # Categorize
+              # Category
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
                 CATEGORY="medical"
               elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
@@ -257,7 +274,7 @@ jobs:
                 CATEGORY="general"
               fi
 
-              # Sentiment + naive recommendation
+              # Sentiment
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT=":large_green_circle: [POSITIVE]"
                 RECOMMENDATION="BUY"
@@ -308,11 +325,12 @@ jobs:
             echo "✅ No new articles in the last 10 minutes."
           fi
 
-      # ===== Manual PRN-style headline test against your local DB =====
-      - name: Manual headline extractor + local DB lookup test
+      # ======= Manual headline test against your local list =======
+      - name: Manual extractor + local list test
+        shell: bash
         run: |
           set -euo pipefail
-          export LC_ALL=C
+          echo "🧪 Testing headline → company → ticker…"
 
           norm_company_name() {
             echo "$1" \
@@ -320,7 +338,7 @@ jobs:
               | sed 's/[“”"'\''()]//g' \
               | sed 's/&/ and /g' \
               | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/[^[:alnum:]_. -]/ /g' \
+              | sed -E 's/[^0-9A-Za-z_. -]/ /g' \
               | tr '[:upper:]' '[:lower:]' \
               | sed -E 's/ +/ /g; s/^ +| +$//g'
           }
@@ -336,28 +354,14 @@ jobs:
             awk -v verbs="$VERBS" 'function tolow(s){ out=s; gsub(/[[:punct:]]/,"",out); return tolower(out) }
               BEGIN{ split(verbs,v,"|"); for(i in v) V[v[i]]=1; }
               { n=NF; chunk="";
-                for(i=1;i<=n;i++){ wl=tolow($i); if (wl in V) break; if ($i ~ /^[A-Z][A-Za-z0-9.-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){ chunk = (length(chunk)?chunk" ":"") $i } else if (length(chunk)>0) break }
+                for(i=1;i<=n;i++){ wl=tolow($i); if (wl in V) break;
+                  if ($i ~ /^[A-Z][A-Za-z0-9.-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){ chunk = (length(chunk)?chunk" ":"") $i }
+                  else if (length(chunk)>0) break
+                }
                 print chunk }' <<<"$pre"
           }
 
-          resolve_company_local() {
-            local raw="$1"
-            local key=$(norm_company_name "$raw")
-            local hit
-            hit=$(jq -cr --arg k "$key" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
-            if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
-            local words=($key)
-            while [ ${#words[@]} -gt 1 ]; do
-              unset 'words[${#words[@]}-1]'
-              k2="${words[*]}"; k2=$(echo "$k2" | sed -E 's/ +/ /g')
-              hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
-              if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
-            done
-            echo '{"ticker":null}'
-          }
-
-          echo "📰 Testing extractor + local DB…"
-          HEADLINES=(
+          test_headlines=(
             "AEWIN Launches SCB-1953 Series High-Performance Network Appliances Powered by Intel Xeon 6 Processors"
             "Sungrow Inverters Successfully Pass the Brazilian Grid Operator Validations"
             "Apple Announces New AI-Powered iPhone Features"
@@ -368,15 +372,20 @@ jobs:
             "Pfizer and BioNTech Announce FDA Approval of Updated COVID-19 Vaccine"
           )
 
-          for H in "${HEADLINES[@]}"; do
+          for H in "${test_headlines[@]}"; do
             cand=$(extract_candidates "$H" | sed -E 's/^ +| +$//g' | head -n1)
-            echo "📰 $H"
-            echo "   → Candidate: ${cand:-<none>}"
-            if [ -z "${cand:-}" ]; then echo "   → ❌ no candidate"; echo "---------------------------------"; continue; fi
-            info_json=$(resolve_company_local "$cand")
-            ticker=$(jq -r '.ticker // empty' <<<"$info_json")
+            printf "📰 %s\n" "$H"
+            printf "   → Candidate: %s\n" "${cand:-<none>}"
+            if [ -z "${cand:-}" ]; then
+              echo "   → ❌ no candidate"
+              echo "---------------------------------"
+              continue
+            fi
+            key=$(norm_company_name "$cand")
+            hit=$(jq -cr --arg k "$key" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
+            ticker=$(jq -r '.ticker // empty' <<<"$hit")
             if [ -n "$ticker" ]; then
-              echo "   → ✅ $ticker (in your local US list)"
+              echo "   → ✅ $ticker (found in your local US list)"
             else
               echo "   → ❌ not found in your local list"
             fi
