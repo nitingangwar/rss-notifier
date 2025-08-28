@@ -39,124 +39,50 @@ jobs:
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      - name: Build symbol database from local table (TSV)
+      - name: Build symbol database from local TSV (no awk/heredoc)
         shell: bash
         run: |
           set -euo pipefail
           export LC_ALL=C
           mkdir -p .cache
       
-          INPUT_FILE="data/symbols.csv"   # ← keep your file here even if it's TSV
+          INPUT_FILE="data/symbols.csv"   # your tab-separated file (can be .tsv)
           if [ ! -f "$INPUT_FILE" ]; then
             echo "❌ $INPUT_FILE not found."
             exit 1
           fi
       
-          # Detect delimiter: tab or comma
-          header_line=$(head -n1 "$INPUT_FILE")
-          if printf '%s' "$header_line" | grep -q $'\t'; then
-            DELIM=$'\t'   # TSV
-          else
-            DELIM=','     # CSV
-          fi
+          # Parse TSV → JSON rows, then normalize & build key→ticker map with alternates
+          mlr --itsv --ojson cat "$INPUT_FILE" \
+          | jq -s '
+              def norm:
+                gsub("[™®©]"; "") |
+                gsub("[“”\"()]"; "") |
+                gsub("&"; " and ") |
+                gsub("\\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\\.?A\\.?)\\b\\.?\\,?"; "") |
+                gsub("[^0-9A-Za-z_. \\-]"; " ") |
+                gsub("\\s+"; " ") |
+                ltrimstr(" ") | rtrimstr(" ") |
+                ascii_downcase;
       
-          # Build JSONL of keys → (ticker), supporting both CSV and TSV cleanly
-          JSONL=/tmp/sym_records.jsonl
-          : > "$JSONL"
-      
-          if [ "$DELIM" = $'\t' ]; then
-            # ---------- TSV path ----------
-            awk -F'\t' 'NR>1 {
-              sym=$1; name=$2;
-              if (sym=="" || name=="") next;
-      
-              # normalize function in awk
-              n=name;
-              gsub(/[™®©]/, "", n);
-              gsub(/[“”"\(\)]/, "", n);
-              gsub(/&/, " and ", n);
-              gsub(/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?/Ig, "", n);
-              gsub(/[^0-9A-Za-z_. \-]/, " ", n);
-              gsub(/[[:space:]]+/, " ", n);
-              sub(/^ +/, "", n); sub(/ +$/, "", n);
-              low=n; for(i=1;i<=length(low);i++){ c=substr(low,i,1); if (c~/[A-Z]/) low=substr(low,1,i-1) tolower(c) substr(low,i+1) }
-      
-              if (length(low)>0) {
-                printf("{\"k\":%s,\"t\":%s}\n", shellquote(low), shellquote(sym)) >> "'"$JSONL"'"
-              }
-      
-              clean=name;
-              gsub(/[^0-9A-Za-z_. \-]/, " ", clean);
-              gsub(/[[:space:]]+/, " ", clean);
-              sub(/^ +/, "", clean); sub(/ +$/, "", clean);
-      
-              split(clean,toks," ");
-              if (length(toks)>=1) {
-                alt1=toks[1] (length(toks)>=2?" " toks[2]:"");
-                # norm alt1
-                n1=alt1;
-                gsub(/[™®©]/, "", n1);
-                gsub(/[“”"\(\)]/, "", n1);
-                gsub(/&/, " and ", n1);
-                gsub(/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?/Ig, "", n1);
-                gsub(/[^0-9A-Za-z_. \-]/, " ", n1);
-                gsub(/[[:space:]]+/, " ", n1);
-                sub(/^ +/, "", n1); sub(/ +$/, "", n1);
-                low1=n1; for(i=1;i<=length(low1);i++){ c=substr(low1,i,1); if (c~/[A-Z]/) low1=substr(low1,1,i-1) tolower(c) substr(low1,i+1) }
-                if (length(low1)>0) printf("{\"k\":%s,\"t\":%s}\n", shellquote(low1), shellquote(sym)) >> "'"$JSONL"'"
-      
-                alt2=toks[1];
-                n2=alt2;
-                gsub(/[™®©]/, "", n2);
-                gsub(/[“”"\(\)]/, "", n2);
-                gsub(/&/, " and ", n2);
-                gsub(/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?/Ig, "", n2);
-                gsub(/[^0-9A-Za-z_. \-]/, " ", n2);
-                gsub(/[[:space:]]+/, " ", n2);
-                sub(/^ +/, "", n2); sub(/ +$/, "", n2);
-                low2=n2; for(i=1;i<=length(low2);i++){ c=substr(low2,i,1); if (c~/[A-Z]/) low2=substr(low2,1,i-1) tolower(c) substr(low2,i+1) }
-                if (length(low2)>0) printf("{\"k\":%s,\"t\":%s}\n", shellquote(low2), shellquote(sym)) >> "'"$JSONL"'"
-            }
-            # helper for safe JSON string quoting using jq
-            function shellquote(s,   cmd, out) {
-              cmd="jq -Rs ."; print s | cmd; cmd | getline out; close(cmd); return out;
-            }' "$INPUT_FILE"
-          else
-            # ---------- CSV path ----------
-            mlr --icsv --ojson cat "$INPUT_FILE" \
-            | jq -r '
-                def norm:
-                  gsub("[™®©]"; "") |
-                  gsub("[“”\"()]"; "") |
-                  gsub("&"; " and ") |
-                  gsub("\\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\\.?A\\.?)\\b\\.?\\,?"; "") |
-                  gsub("[^0-9A-Za-z_. \\-]"; " ") |
-                  gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ") | ascii_downcase;
-                .[]
-                | select((.Symbol//"")!="" and (.Name//"")!="")
-                | (.Name | norm) as $k
-                | (.Name
-                    | gsub("[^0-9A-Za-z_. \\-]"; " ")
-                    | gsub("\\s+"; " ")
-                    | ltrimstr(" ") | rtrimstr(" ")
-                    | ascii_downcase) as $clean
-                | ($clean | split(" ")[0:2] | join(" ") | norm) as $alt1
-                | ($clean | split(" ")[0] // "" | norm) as $alt2
-                | ({k:$k,t:.Symbol}),
-                  (select(($alt1|length)>0) | {k:$alt1,t:.Symbol}),
-                  (select(($alt2|length)>0) | {k:$alt2,t:.Symbol})
-              ' >> "$JSONL"
-          fi
-      
-          # Reduce to a single map: key → {ticker}
-          jq -s '
-            reduce .[] as $r ({}; if has($r.k) then . else .[$r.k] = {ticker:$r.t} end)
-          ' "$JSONL" > .cache/symbol_db.json
+              reduce .[] as $r ({}; 
+                if (($r.Symbol // "") != "" and ($r.Name // "") != "") then
+                  ($r.Name | norm) as $key
+                  | ($r.Name
+                      | gsub("[^0-9A-Za-z_. \\-]"; " ")
+                      | gsub("\\s+"; " ")
+                      | ltrimstr(" ") | rtrimstr(" ")
+                      | ascii_downcase) as $clean
+                  | ($clean | split(" ") | .[0:2] | join(" ") | norm) as $alt1
+                  | ($clean | split(" ") | (.[0] // "") | norm) as $alt2
+                  | .[$key] = {ticker: $r.Symbol}
+                  | (if ($alt1|length)>0 and (has($alt1)|not) then .[$alt1] = {ticker: $r.Symbol} else . end)
+                  | (if ($alt2|length)>0 and (has($alt2)|not) then .[$alt2] = {ticker: $r.Symbol} else . end)
+                else . end
+              )
+            ' > .cache/symbol_db.json
       
           echo "✅ Built symbol DB with $(jq 'keys|length' .cache/symbol_db.json) entries"
-
-
-
 
       # ===== Parse feeds + PRN filter (using your local symbol DB) =====
       - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
