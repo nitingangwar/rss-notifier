@@ -104,40 +104,26 @@ jobs:
           echo "$NEW_HASH" > .cache/symbols.sha256
           echo "✅ Lookup built (keys: $(jq 'keys|length' .cache/symbol_db.json))"
 
-      - name: Debug PRN feed (show 5 titles)
+      - name: Debug PRN feed (raw dump)
         shell: bash
         run: |
           set -uo pipefail
           URL="https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-          curl -sL --max-time 15 \
+      
+          echo "Fetching PRN feed..."
+          curl -v -sL --max-time 15 \
             -A "$UA" \
             -H 'Accept: application/rss+xml,application/xml;q=0.9,*/*;q=0.8' \
             -H 'Referer: https://www.prnewswire.com/rss/' \
-            "$URL" > /tmp/prn.xml || true
+            "$URL" -o /tmp/prn.xml || true
       
-          if file /tmp/prn.xml | grep -qi 'xml'; then
-            echo "✅ PRN XML received; first 5 titles:"
+          echo "File type:"
+          file /tmp/prn.xml || true
       
-            # Try XPath first, but don't let it fail the step
-            set +e
-            xmllint --xpath '//item/title' /tmp/prn.xml > /tmp/titles.raw 2>/dev/null
-            code=$?
-            set -e
-      
-            if [ $code -eq 0 ] && [ -s /tmp/titles.raw ]; then
-              # Split <title>...</title> nodes into lines and print first 5 item titles
-              sed 's#</title>#\n#g; s#<title>##g' /tmp/titles.raw \
-                | sed -n '1,5p'
-            else
-              # Fallback: grep titles; skip channel title (first one), show next 5
-              grep -oP '(?<=<title>).*?(?=</title>)' /tmp/prn.xml \
-                | tail -n +2 | head -n 5 || true
-            fi
-          else
-            echo "⚠️ PRN not XML; showing first 400 bytes (likely CDN block):"
-            head -c 400 /tmp/prn.xml || true
-          fi
+          echo "First 50 lines of /tmp/prn.xml:"
+          head -n 50 /tmp/prn.xml || true
+
 
 
       # ===== Parse feeds; PRN filtered via local lookup + negative cache =====
