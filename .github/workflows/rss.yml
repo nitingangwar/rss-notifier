@@ -1,4 +1,4 @@
-name: Categorized RSS Alerts with Sentiment (Local TSV + Neg Cache)
+name: Categorized RSS Alerts with Sentiment (Local TSV + Neg Cache + PRN Hardened)
 
 on:
   workflow_dispatch: {}
@@ -39,7 +39,7 @@ jobs:
           [ -f .cache/symbols.sha256 ]   || : > .cache/symbols.sha256
           [ -f .cache/negative_prn.json ] || echo '{}' > .cache/negative_prn.json
 
-      # Build a key→ticker lookup from your tab-separated data/symbols.csv
+      # ===== Build a key→ticker lookup from your tab-separated data/symbols.csv =====
       - name: Build symbol lookup (only if TSV changed)
         shell: bash
         run: |
@@ -75,6 +75,7 @@ jobs:
             printf '%s' "$s"
           }
 
+          # Read Symbol<TAB>Name<…>
           tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name _; do
             [ -z "${sym:-}" ] && continue
             [ -z "${name:-}" ] && continue
@@ -103,7 +104,32 @@ jobs:
           echo "$NEW_HASH" > .cache/symbols.sha256
           echo "✅ Lookup built (keys: $(jq 'keys|length' .cache/symbol_db.json))"
 
-      - name: Parse RSS Feeds → Slack (with neg cache)
+      # ===== Quick debug to verify PRN returns XML and items =====
+      - name: Debug PRN feed (show 5 titles)
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          curl -sL --max-time 15 \
+            -A "$UA" \
+            -H 'Accept: application/rss+xml,application/xml;q=0.9,*/*;q=0.8' \
+            -H 'Referer: https://www.prnewswire.com/rss/' \
+            "$URL" > /tmp/prn.xml || true
+
+          if file /tmp/prn.xml | grep -qi 'xml'; then
+            echo "✅ PRN XML received; first 5 titles:"
+            for i in 1 2 3 4 5; do
+              t=$(xmllint --xpath "string((//item|//entry)[$i]/title)" /tmp/prn.xml 2>/dev/null || true)
+              [ -n "$t" ] && echo "• $t"
+            done
+          else
+            echo "⚠️ PRN not XML; showing first 400 bytes (likely CDN block):"
+            head -c 400 /tmp/prn.xml || true
+          fi
+
+      # ===== Parse feeds; PRN filtered via local lookup + negative cache =====
+      - name: Parse RSS Feeds → Slack (with neg cache, PRN hardened)
         env:
           SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
           SLACK_WEBHOOK_MEDICAL: ${{ secrets.SLACK_WEBHOOK_MEDICAL }}
@@ -142,10 +168,12 @@ jobs:
           }
 
           PER_FEED_ITEMS=3
-          WINDOW_SEC=600
+          WINDOW_SEC=600         # default window for BWire/Globe
+          PRN_WINDOW_SEC=3600    # PRN gets a 60-minute window
           CURRENT_TIME=$(date -u +%s)
           TEN_MINUTES_AGO=$((CURRENT_TIME - WINDOW_SEC))
 
+          # prune rolling 10-min cache ("<epoch> <headline_hash>")
           awk -v cutoff="$TEN_MINUTES_AGO" '{
             if (NF >= 2) { epoch=$1; if (epoch ~ /^[0-9]+$/ && epoch >= cutoff) print $0; }
           }' .cache/last_10min_articles.txt > .cache/_pruned.tmp || true
@@ -196,13 +224,29 @@ jobs:
             jq -cr --arg k "$key" 'if has($k) then .[$k] else null end' .cache/symbol_db.json
           }
 
+          # UA/headers for hardened fetching
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+          ACCEPT='application/rss+xml,application/xml;q=0.9,*/*;q=0.8'
+          REF='https://www.prnewswire.com/rss/'
+
           NEW_ARTICLE_FOUND=false
 
           for FEED_URL in "${FEEDS[@]}"; do
             echo "🔍 Checking Feed: $FEED_URL"
+
             XML_FILE=$(mktemp)
-            curl -sL "$FEED_URL" > "$XML_FILE" || true
-            [ ! -s "$XML_FILE" ] && { echo "⚠️ Empty response"; rm -f "$XML_FILE"; continue; }
+            # Hardened fetch (works for all feeds; helps with PRN CDN)
+            curl -sL --max-time 20 \
+              -A "$UA" \
+              -H "Accept: $ACCEPT" \
+              -H "Referer: $REF" \
+              "$FEED_URL" > "$XML_FILE" || true
+
+            if ! file "$XML_FILE" | grep -qi 'xml'; then
+              echo "⚠️ Non-XML or empty response; skipping feed."
+              rm -f "$XML_FILE"
+              continue
+            fi
 
             for i in $(seq 1 "$PER_FEED_ITEMS"); do
               LINK=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href")
@@ -212,21 +256,44 @@ jobs:
 
               [ -z "$LINK" ] && continue
               [ -z "$TITLE" ] && TITLE="(No Title)"
+              [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
 
               DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//' | head -c 300)
               CONTENT="$TITLE $DESCRIPTION"
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
+              # Time filtering: PRN gets 60-min window + fallback to now if date missing
               ARTICLE_TIME=$(date -d "$PUBDATE" +%s 2>/dev/null || echo 0)
-              [ "$ARTICLE_TIME" -eq 0 ] && continue
-              [ "$ARTICLE_TIME" -lt "$TEN_MINUTES_AGO" ] && continue
+              if [ "$FEED_URL" = "$PRN_FEED" ]; then
+                CUTOFF=$((CURRENT_TIME - PRN_WINDOW_SEC))
+                [ "$ARTICLE_TIME" -eq 0 ] && ARTICLE_TIME=$CURRENT_TIME
+              else
+                CUTOFF=$TEN_MINUTES_AGO
+                [ "$ARTICLE_TIME" -eq 0 ] && ARTICLE_TIME=0
+              fi
+
+              if [ "$ARTICLE_TIME" -lt "$CUTOFF" ] || [ "$ARTICLE_TIME" -eq 0 ]; then
+                echo "⏱️ Skipping (outside window): $TITLE"
+                continue
+              fi
 
               HEADLINE_HASH=$(echo -n "$TITLE" | md5sum | cut -d ' ' -f1)
-              if grep -qx "$HEADLINE_HASH" <(awk '{print $2}' .cache/last_10min_articles.txt); then continue; fi
+              if grep -qx "$HEADLINE_HASH" <(awk '{print $2}' .cache/last_10min_articles.txt); then
+                echo "🔁 Skipping duplicate (10-min window): $TITLE"
+                continue
+              fi
 
               LINK_HASH=$(echo -n "$LINK" | md5sum | cut -d ' ' -f1)
-              if grep -qx "$LINK_HASH" .cache/sent_hashes.txt; then continue; fi
+              if grep -qx "$LINK_HASH" .cache/sent_hashes.txt; then
+                echo "🧭 Already sent (by link): $TITLE"
+                continue
+              fi
+              if grep -qx "$HEADLINE_HASH" .cache/sent_hashes.txt; then
+                echo "🧭 Already sent (by headline): $TITLE"
+                continue
+              fi
 
+              # PR Newswire filter (first word → fallback) + negative cache
               if [ "$FEED_URL" = "$PRN_FEED" ]; then
                 fw=$(extract_firstword "$TITLE")
                 cand_key=$(norm_company_name "$fw")
@@ -243,18 +310,20 @@ jobs:
                   echo "🇺🇸✅ PRN matched by first word: $TITLE ($fw → $fw_ticker)"
                 else
                   cand=$(extract_chunk_before_verb "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
-                  [ -z "$cand" ] && { mark_negative "$cand_key"; continue; }
-
+                  if [ -z "$cand" ]; then
+                    echo "🚫 PRN no candidate → cache negative for first word key: $fw"
+                    mark_negative "$cand_key"
+                    continue
+                  fi
                   cand_key=$(norm_company_name "$cand")
                   if is_negative_cached "$cand_key"; then
                     echo "🚫 Skipping PRN (cached negative): $TITLE (cand: $cand)"
                     continue
                   fi
-
                   info_json=$(resolve_company_local "$cand")
                   ticker=$(jq -r '.ticker // empty' <<<"$info_json")
                   if [ -z "$ticker" ]; then
-                    echo "🚫 PRN not US-listed → caching negative: $TITLE (cand: $cand)"
+                    echo "🚫 PRN not in local US list → caching negative: $TITLE (cand: $cand)"
                     mark_negative "$cand_key"
                     continue
                   fi
@@ -262,21 +331,25 @@ jobs:
                 fi
               fi
 
-              CATEGORY="general"
+              # Category
               if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
                 CATEGORY="medical"
               elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
                 CATEGORY="contracts"
+              else
+                CATEGORY="general"
               fi
 
-              SENTIMENT=":white_circle: [NEUTRAL]"
-              RECOMMENDATION="HOLD"
+              # Sentiment
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT=":large_green_circle: [POSITIVE]"
                 RECOMMENDATION="BUY"
               elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
                 SENTIMENT=":red_circle: [NEGATIVE]"
                 RECOMMENDATION="SELL"
+              else
+                SENTIMENT=":white_circle: [NEUTRAL]"
+                RECOMMENDATION="HOLD"
               fi
 
               PAYLOAD=$(jq -n \
@@ -308,6 +381,7 @@ jobs:
               echo "$CURRENT_TIME $HEADLINE_HASH" >> .cache/last_10min_articles.txt
               NEW_ARTICLE_FOUND=true
             done
+
             rm -f "$XML_FILE"
           done
 
