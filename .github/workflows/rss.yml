@@ -39,70 +39,85 @@ jobs:
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      # ===== Build symbol DB from your local CSV (data/symbols.csv) =====
       - name: Build symbol database from local CSV
         shell: bash
         run: |
           set -euo pipefail
           export LC_ALL=C
           mkdir -p .cache
-
+      
           INPUT_FILE="data/symbols.csv"
           if [ ! -f "$INPUT_FILE" ]; then
-            echo "❌ $INPUT_FILE not found. Please add it to your repo."
+            echo "❌ $INPUT_FILE not found. Add it in your repo (via GitHub UI: data/symbols.csv)."
             exit 1
           fi
-
-          # Write a tiny Python script to parse CSV safely and build symbol_db.json
-          cat > /tmp/build_symbol_db.py <<'PY'
-import csv, json, re, sys
-from pathlib import Path
-
-inp = Path("data/symbols.csv")
-if not inp.exists():
-    print("Missing data/symbols.csv", file=sys.stderr)
-    sys.exit(1)
-
-def norm(s: str) -> str:
-    s = re.sub(r'[™®©]', '', s or '')
-    s = re.sub(r'[“”"()]', '', s)
-    s = s.replace('&', ' and ')
-    s = re.sub(r'\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?', '', s, flags=re.I)
-    s = re.sub(r'[^0-9A-Za-z_. \-]+', ' ', s)
-    s = re.sub(r'\s+', ' ', s).strip().lower()
-    return s
-
-db = {}
-with inp.open('r', encoding='utf-8', newline='') as f:
-    reader = csv.DictReader(f)
-    # Expect at least "Symbol" and "Name" columns
-    for row in reader:
-        sym = (row.get('Symbol') or '').strip()
-        name = (row.get('Name') or '').strip()
-        if not sym or not name:
-            continue
-        key = norm(name)
-        if key and key not in db:
-            db[key] = {"ticker": sym}
-        # helpful alternates: first two tokens, first token
-        clean = re.sub(r'[^0-9A-Za-z_. \-]+', ' ', name)
-        clean = re.sub(r'\s+', ' ', clean).strip()
-        toks = clean.split()
-        if toks:
-            alt1 = norm(' '.join(toks[:2]))
-            if alt1 and alt1 not in db:
-                db[alt1] = {"ticker": sym}
-            alt2 = norm(toks[0])
-            if alt2 and alt2 not in db:
-                db[alt2] = {"ticker": sym}
-
-# Dump to cache
-Path(".cache/symbol_db.json").write_text(json.dumps(db), encoding='utf-8')
-print(f"Built {len(db)} keys", file=sys.stderr)
-PY
-
-          python3 /tmp/build_symbol_db.py
+      
+          # --- Parse CSV safely with gawk (handles quoted commas) ---
+          # Produce TSV lines: "<normalized_key>\t<TICKER>" including alternates (first 2 words, first word)
+          gawk -v FPAT='([^,]*)|(\"([^\"]|\"\")+\")' '
+            BEGIN{ IGNORECASE=1 }
+            NR==1 {
+              for(i=1;i<=NF;i++){
+                h=$i; gsub(/^"|"$/,"",h); gsub(/""/,"\"",h)
+                tl=tolower(h)
+                if(tl=="symbol") isym=i
+                if(tl=="name")   iname=i
+              }
+              next
+            }
+            {
+              sym=$isym; name=$iname
+              gsub(/^"|"$/,"",sym);  gsub(/""/,"\"",sym)
+              gsub(/^"|"$/,"",name); gsub(/""/,"\"",name)
+              if(sym=="" || name=="") next
+      
+              # normalize function inline
+              function norm(s, t){
+                t=s
+                gsub(/[™®©]/,"",t)
+                gsub(/[“”"]|\(/,"",t); gsub(/\)/,"",t)
+                gsub(/&/," and ",t)
+                gsub(/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?/,"",t)
+                gsub(/[^[:alnum:]_. -]/," ",t)
+                gsub(/[ ]+/," ",t); sub(/^[ ]+/,"",t); sub(/[ ]+$/,"",t)
+                return tolower(t)
+              }
+      
+              key = norm(name)
+              if(key!="") print key "\t" sym
+      
+              clean=name
+              gsub(/[^[:alnum:]_. -]/," ",clean)
+              gsub(/[ ]+/," ",clean); sub(/^[ ]+/,"",clean); sub(/[ ]+$/,"",clean)
+              n=split(clean, a, /[ ]+/)
+      
+              if(n>=2){
+                alt1 = norm(a[1] " " a[2])
+                if(alt1!="") print alt1 "\t" sym
+              }
+              if(n>=1){
+                alt2 = norm(a[1])
+                if(alt2!="") print alt2 "\t" sym
+              }
+            }
+          ' "$INPUT_FILE" > /tmp/key_ticker.tsv
+      
+          # Convert TSV → JSONL safely (proper escaping)
+          JSONL=/tmp/sym_records.jsonl
+          : > "$JSONL"
+          while IFS=$'\t' read -r K T; do
+            [ -z "${K:-}" ] && continue
+            printf '{"k":%s,"t":%s}\n' \
+              "$(jq -Rs . <<<"$K")" \
+              "$(jq -Rs . <<<"$T")" >> "$JSONL"
+          done < /tmp/key_ticker.tsv
+      
+          # Reduce to symbol_db.json (first win)
+          jq -s 'reduce .[] as $r ({}; if has($r.k) then . else .[$r.k] = {ticker:$r.t} end)' "$JSONL" \
+            > .cache/symbol_db.json
+      
           echo "✅ Built symbol DB with $(jq 'keys|length' .cache/symbol_db.json) entries"
+
 
       # ===== Parse feeds + PRN filter (using your local symbol DB) =====
       - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
