@@ -17,7 +17,7 @@ jobs:
       - name: Set up environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxml2-utils w3m jq curl coreutils gawk
+          sudo apt-get install -y libxml2-utils w3m jq curl coreutils gawk miller
 
       # Pull repo contents (so we can read data/symbols.csv)
       - name: Checkout
