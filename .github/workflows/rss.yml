@@ -184,7 +184,10 @@ jobs:
               continue
             fi
 
-            for i in $(seq 1 "$PER_FEED_ITEMS"); do
+            ITEMS=$(xmllint --xpath 'count(//item | //entry)' "$XML_FILE" 2>/dev/null || echo 0)
+            ITEMS=${ITEMS%.*} 
+
+            for i in $(seq 1 "$ITEMS"); do
               LINK=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href")
               TITLE=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/title")
               DESCRIPTION=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/description | //entry[$i]/summary")
