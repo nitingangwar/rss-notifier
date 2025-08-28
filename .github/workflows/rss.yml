@@ -36,7 +36,7 @@ jobs:
           [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      - name: Build/refresh US symbol database (NASDAQ/NYSE/Arca/Amex) — no Python
+      - name: Build/refresh US symbol database (robust: Nasdaq → SEC → seed)
         shell: bash
         run: |
           set -euo pipefail
@@ -48,76 +48,156 @@ jobs:
             [ "${last:-}" = "$today" ] && refresh=false
           fi
 
-          if [ "$refresh" = true ]; then
-            echo "🔄 Refreshing symbol DB…"
-            curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt -o /tmp/nasdaqtraded.txt
-            curl -sSL https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt -o /tmp/otherlisted.txt
+          if [ "$refresh" = false ]; then
+            echo "🟢 Using cached symbol DB (entries: $(jq 'keys|length' .cache/symbol_db.json))"
+            exit 0
+          fi
 
-            # Build a unified TSV: <SYM>\t<NAME>\t<EXCH_DISP>
+          echo "🔄 Refreshing symbol DB…"
+          : > /tmp/all_listed.tsv
+
+          # ---------- 1) Try Nasdaq Trader (https → http, with retries) ----------
+          fetch_ok=false
+          for proto in https http; do
+            for i in 1 2 3; do
+              echo "… fetching ${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt (try $i)"
+              if curl -fsSL --max-time 30 "${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt" -o /tmp/nasdaqtraded.txt; then
+                echo "… fetching ${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt (try $i)"
+                if curl -fsSL --max-time 30 "${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt" -o /tmp/otherlisted.txt; then
+                  fetch_ok=true
+                  break
+                fi
+              fi
+              sleep $((i*2))
+            done
+            [ "$fetch_ok" = true ] && break
+          done
+
+          if [ "$fetch_ok" = true ]; then
+            echo "✅ Nasdaq Trader fetched"
+            # NASDAQ (pipe-delimited)
             awk -F'|' 'NR>1 && $0 !~ /File Creation Time/ && $0 !~ /^Symbol\|/ && $0!="" {
-              sym=$1; name=$2; printf "%s\t%s\t%s\n", sym, name, "NASDAQ"
-            }' /tmp/nasdaqtraded.txt > /tmp/all_listed.tsv
+              sym=$1; name=$2;
+              if (sym!="" && name!="") printf "%s\t%s\t%s\n", sym, name, "NASDAQ"
+            }' /tmp/nasdaqtraded.txt >> /tmp/all_listed.tsv
 
+            # OTHERLISTED (NYSE/Arca/Amex)
             awk -F'|' 'NR>1 && $0!="" {
               sym=$1; name=$2; ex=$3;
               exd=(ex=="N"?"NYSE":(ex=="A"?"NYSE American":(ex=="P"?"NYSE Arca":ex)));
-              printf "%s\t%s\t%s\n", sym, name, exd
+              if (sym!="" && name!="" && exd!="") printf "%s\t%s\t%s\n", sym, name, exd
             }' /tmp/otherlisted.txt >> /tmp/all_listed.tsv
+          else
+            echo "⚠️ Nasdaq Trader unavailable from runner. Falling back to SEC."
 
-            # Normalizer (bash+sed): lowercase, strip punctuation & legal suffixes
-            norm() {
-              echo "$1" \
-                | sed 's/[™®©]//g' \
-                | sed 's/[“”"()]//g' \
-                | sed 's/&/ and /g' \
-                | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-                | sed -E 's/[^A-Za-z0-9_.\- ]/ /g' \
-                | tr '[:upper:]' '[:lower:]' \
-                | sed -E 's/ +/ /g; s/^ +| +$//g'
-            }
+            # ---------- 2) Try SEC company_tickers_exchange.json ----------
+            UA='rss-alerts/1.0 (+https://github.com/your/repo; contact@example.com)'
+            if curl -fsSL --max-time 45 -H "User-Agent: $UA" \
+                 https://www.sec.gov/files/company_tickers_exchange.json -o /tmp/sec_exchange.json; then
+              echo "✅ SEC exchange JSON fetched"
+              if jq -e 'type=="array"' /tmp/sec_exchange.json >/dev/null 2>&1; then
+                jq -r '.[] | select(.ticker and .title and .exchange)
+                       | "\(.ticker)\t\(.title)\t\(.exchange)"' /tmp/sec_exchange.json >> /tmp/all_listed.tsv
+              else
+                jq -r 'to_entries[] | .value | select(.ticker and .title and .exchange)
+                       | "\(.ticker)\t\(.title)\t\(.exchange)"' /tmp/sec_exchange.json >> /tmp/all_listed.tsv
+              fi
+            else
+              echo "⚠️ SEC exchange file not reachable. Trying SEC basic tickers…"
+              # 3) SEC company_tickers.json (no exchange) — set exchange empty
+              if curl -fsSL --max-time 45 -H "User-Agent: $UA" \
+                   https://www.sec.gov/files/company_tickers.json -o /tmp/sec_basic.json; then
+                echo "✅ SEC basic JSON fetched"
+                if jq -e 'type=="array"' /tmp/sec_basic.json >/dev/null 2>&1; then
+                  jq -r '.[] | select(.ticker and .title)
+                         | "\(.ticker)\t\(.title)\t"' /tmp/sec_basic.json >> /tmp/all_listed.tsv
+                else
+                  jq -r 'to_entries[] | .value | select(.ticker and .title)
+                         | "\(.ticker)\t\(.title)\t"' /tmp/sec_basic.json >> /tmp/all_listed.tsv
+                fi
+              fi
+            fi
+          fi
 
-            # Create a JSONL of candidate keys -> ticker/exch (primary + alt keys)
-            JSONL=/tmp/sym_records.jsonl
-            : > "$JSONL"
+          # ---------- 3) Last resort seed (so job never hard-fails) ----------
+          if [ ! -s /tmp/all_listed.tsv ]; then
+            echo "⚠️ Using built-in seed list."
+            cat > /tmp/all_listed.tsv <<'EOF'
+AAPL	Apple Inc.	NASDAQ
+TSLA	Tesla, Inc.	NASDAQ
+PFE	Pfizer Inc.	NYSE
+NVS	Novartis AG	NYSE
+INFY	Infosys Limited	NYSE
+ZM	Zoom Video Communications, Inc.	NASDAQ
+NVDA	NVIDIA Corporation	NASDAQ
+MU	Micron Technology, Inc.	NASDAQ
+JPM	JPMorgan Chase & Co.	NYSE
+EOF
+          fi
 
-            while IFS=$'\t' read -r SYM NAME EXCH; do
-              [ -z "${SYM:-}" ] || [ -z "${NAME:-}" ] && continue
-              key=$(norm "$NAME")
-              [ -n "$key" ] && printf '{"k":%s,"t":%s,"e":%s}\n' \
+          echo "📄 Raw symbol rows: $(wc -l < /tmp/all_listed.tsv)"
+
+          # ---------- Build symbol_db.json (Bash + jq) ----------
+          norm() {
+            echo "$1" \
+              | sed 's/[™®©]//g' \
+              | sed 's/[“”"()]//g' \
+              | sed 's/&/ and /g' \
+              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
+              | sed -E 's/[^A-Za-z0-9_.\- ]/ /g' \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/ +/ /g; s/^ +| +$//g'
+          }
+
+          map_exch() {
+            case "$1" in
+              NASDAQ|Nasdaq|NasdaqGS|NasdaqGM|NasdaqCM) echo "NASDAQ" ;;
+              NYSE|New\ York\ Stock\ Exchange) echo "NYSE" ;;
+              NYSE\ American|AMEX|Amex) echo "NYSE American" ;;
+              NYSE\ Arca|Arca) echo "NYSE Arca" ;;
+              "" ) echo "" ;;
+              * ) echo "$1" ;;
+            esac
+          }
+
+          JSONL=/tmp/sym_records.jsonl
+          : > "$JSONL"
+
+          while IFS=$'\t' read -r SYM NAME EXCH; do
+            [ -z "${SYM:-}" ] && continue
+            [ -z "${NAME:-}" ] && continue
+            EXD=$(map_exch "${EXCH:-}")
+            key=$(norm "$NAME")
+            if [ -n "$key" ]; then
+              printf '{"k":%s,"t":%s,"e":%s}\n' \
                 "$(jq -Rs . <<<"$key")" \
                 "$(jq -Rs . <<<"$SYM")" \
-                "$(jq -Rs . <<<"$EXCH")" >> "$JSONL"
+                "$(jq -Rs . <<<"$EXD")" >> "$JSONL"
+            fi
+            clean=$(echo "$NAME" | sed -E 's/[^A-Za-z0-9_.\- ]/ /g' | sed -E 's/ +/ /g')
+            first_two=$(echo "$clean" | awk '{print $1" "$2}')
+            alt1=$(norm "$first_two")
+            if [ -n "$alt1" ]; then
+              printf '{"k":%s,"t":%s,"e":%s}\n' \
+                "$(jq -Rs . <<<"$alt1")" \
+                "$(jq -Rs . <<<"$SYM")" \
+                "$(jq -Rs . <<<"$EXD")" >> "$JSONL"
+            fi
+            first=$(echo "$clean" | awk '{print $1}')
+            alt2=$(norm "$first")
+            if [ -n "$alt2" ]; then
+              printf '{"k":%s,"t":%s,"e":%s}\n' \
+                "$(jq -Rs . <<<"$alt2")" \
+                "$(jq -Rs . <<<"$SYM")" \
+                "$(jq -Rs . <<<"$EXD")" >> "$JSONL"
+            fi
+          done < /tmp/all_listed.tsv
 
-              # alt1: first two tokens of NAME
-              clean=$(echo "$NAME" | sed -E 's/[^A-Za-z0-9_.\- ]/ /g' | sed -E 's/ +/ /g')
-              first_two=$(echo "$clean" | awk '{print $1" "$2}')
-              alt1=$(norm "$first_two")
-              if [ -n "$alt1" ]; then
-                printf '{"k":%s,"t":%s,"e":%s}\n' \
-                  "$(jq -Rs . <<<"$alt1")" \
-                  "$(jq -Rs . <<<"$SYM")" \
-                  "$(jq -Rs . <<<"$EXCH")" >> "$JSONL"
-              fi
-              # alt2: first token of NAME
-              first=$(echo "$clean" | awk '{print $1}')
-              alt2=$(norm "$first")
-              if [ -n "$alt2" ]; then
-                printf '{"k":%s,"t":%s,"e":%s}\n' \
-                  "$(jq -Rs . <<<"$alt2")" \
-                  "$(jq -Rs . <<<"$SYM")" \
-                  "$(jq -Rs . <<<"$EXCH")" >> "$JSONL"
-              fi
-            done < /tmp/all_listed.tsv
+          jq -s 'reduce .[] as $r ({}; if has($r.k) then . else .[$r.k] = {ticker:$r.t, exchange:$r.e} end)' "$JSONL" \
+            > .cache/symbol_db.json
 
-            # Reduce JSONL into a single object; first entry wins for duplicate keys
-            jq -s 'reduce .[] as $r ({}; if has($r.k) then . else .[$r.k] = {ticker:$r.t, exchange:$r.e} end)' "$JSONL" \
-              > .cache/symbol_db.json
-
-            date -u +%F > .cache/symbol_db.stamp
-            echo "✅ Symbol DB entries: $(jq 'keys|length' .cache/symbol_db.json)"
-          else
-            echo "🟢 Using cached symbol DB (entries: $(jq 'keys|length' .cache/symbol_db.json))"
-          fi
+          date -u +%F > .cache/symbol_db.stamp
+          echo "✅ Symbol DB entries: $(jq 'keys|length' .cache/symbol_db.json)"
 
       - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
         env:
