@@ -1,4 +1,4 @@
-name: Categorized RSS Alerts with Sentiment
+name: Categorized RSS Alerts with Sentiment (Local Symbols)
 
 on:
   workflow_dispatch: {}
@@ -19,7 +19,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxml2-utils w3m jq curl coreutils gawk
 
-      # Cross-run cache for dedupe + inventory + symbol DB
+      # Pull repo contents (so we can read data/symbols.csv)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Cache dedupe & the derived symbol DB
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -28,177 +32,79 @@ jobs:
           restore-keys: |
             rss-cache-${{ runner.os }}-
 
-      - name: Create cache files if not exists
+      - name: Ensure cache files
         run: |
           mkdir -p .cache
           [ -f .cache/sent_hashes.txt ] || touch .cache/sent_hashes.txt
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
-          [ -f .cache/company_index.json ] || echo '{}' > .cache/company_index.json
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      - name: Build/refresh US symbol database
+      # ===== Build symbol DB from your local CSV (data/symbols.csv) =====
+      - name: Build symbol database from local CSV
         shell: bash
         run: |
           set -euo pipefail
+          export LC_ALL=C
           mkdir -p .cache
-          today=$(date -u +%F)
-          refresh=true
-          if [ -s .cache/symbol_db.json ] && [ -f .cache/symbol_db.stamp ]; then
-            last=$(cat .cache/symbol_db.stamp || true)
-            [ "${last:-}" = "$today" ] && refresh=false
-          fi
-      
-          if [ "$refresh" = false ]; then
-            echo "🟢 Using cached symbol DB (entries: $(jq 'keys|length' .cache/symbol_db.json))"
-            exit 0
-          fi
-      
-          echo "🔄 Refreshing symbol DB…"
-          : > /tmp/all_listed.tsv
-      
-          # ---------- 1) Try Nasdaq Trader (https → http, with retries) ----------
-          fetch_ok=false
-          for proto in https http; do
-            for i in 1 2 3; do
-              echo "… fetching ${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt (try $i)"
-              if curl -fsSL --max-time 30 "${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqtraded.txt" -o /tmp/nasdaqtraded.txt; then
-                echo "… fetching ${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt (try $i)"
-                if curl -fsSL --max-time 30 "${proto}://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt" -o /tmp/otherlisted.txt; then
-                  fetch_ok=true
-                  break
-                fi
-              fi
-              sleep $((i*2))
-            done
-            [ "$fetch_ok" = true ] && break
-          done
-      
-          if [ "$fetch_ok" = true ]; then
-            echo "✅ Nasdaq Trader fetched"
-            # NASDAQ (pipe-delimited)
-            awk -F'|' 'NR>1 && $0 !~ /File Creation Time/ && $0 !~ /^Symbol\|/ && $0!="" {
-              sym=$1; name=$2;
-              if (sym!="" && name!="") printf "%s\t%s\t%s\n", sym, name, "NASDAQ"
-            }' /tmp/nasdaqtraded.txt >> /tmp/all_listed.tsv
-      
-            # OTHERLISTED (NYSE/Arca/Amex)
-            awk -F'|' 'NR>1 && $0!="" {
-              sym=$1; name=$2; ex=$3;
-              exd=(ex=="N"?"NYSE":(ex=="A"?"NYSE American":(ex=="P"?"NYSE Arca":ex)));
-              if (sym!="" && name!="" && exd!="") printf "%s\t%s\t%s\n", sym, name, exd
-            }' /tmp/otherlisted.txt >> /tmp/all_listed.tsv
-          else
-            echo "⚠️ Nasdaq Trader unavailable from runner. Falling back to SEC."
-      
-            # ---------- 2) Try SEC company_tickers_exchange.json ----------
-            UA='rss-alerts/1.0 (+https://github.com/your/repo; contact@example.com)'
-            if curl -fsSL --max-time 45 -H "User-Agent: $UA" \
-                 https://www.sec.gov/files/company_tickers_exchange.json -o /tmp/sec_exchange.json; then
-              echo "✅ SEC exchange JSON fetched"
-              if jq -e 'type=="array"' /tmp/sec_exchange.json >/dev/null 2>&1; then
-                jq -r '.[] | select(.ticker and .title and .exchange)
-                       | "\(.ticker)\t\(.title)\t\(.exchange)"' /tmp/sec_exchange.json >> /tmp/all_listed.tsv
-              else
-                jq -r 'to_entries[] | .value | select(.ticker and .title and .exchange)
-                       | "\(.ticker)\t\(.title)\t\(.exchange)"' /tmp/sec_exchange.json >> /tmp/all_listed.tsv
-              fi
-            else
-              echo "⚠️ SEC exchange file not reachable. Trying SEC basic tickers…"
-              if curl -fsSL --max-time 45 -H "User-Agent: $UA" \
-                   https://www.sec.gov/files/company_tickers.json -o /tmp/sec_basic.json; then
-                echo "✅ SEC basic JSON fetched"
-                if jq -e 'type=="array"' /tmp/sec_basic.json >/dev/null 2>&1; then
-                  jq -r '.[] | select(.ticker and .title)
-                         | "\(.ticker)\t\(.title)\t"' /tmp/sec_basic.json >> /tmp/all_listed.tsv
-                else
-                  jq -r 'to_entries[] | .value | select(.ticker and .title)
-                         | "\(.ticker)\t\(.title)\t"' /tmp/sec_basic.json >> /tmp/all_listed.tsv
-                fi
-              fi
-            fi
-          fi
-      
-          # ---------- 3) Last resort seed (so job never hard-fails) ----------
-          if [ ! -s /tmp/all_listed.tsv ]; then
-            echo "⚠️ Using built-in seed list."
-            {
-              printf 'AAPL\tApple Inc.\tNASDAQ\n'
-              printf 'TSLA\tTesla, Inc.\tNASDAQ\n'
-              printf 'PFE\tPfizer Inc.\tNYSE\n'
-              printf 'NVS\tNovartis AG\tNYSE\n'
-              printf 'INFY\tInfosys Limited\tNYSE\n'
-              printf 'ZM\tZoom Video Communications, Inc.\tNASDAQ\n'
-              printf 'NVDA\tNVIDIA Corporation\tNASDAQ\n'
-              printf 'MU\tMicron Technology, Inc.\tNASDAQ\n'
-              printf 'JPM\tJPMorgan Chase & Co.\tNYSE\n'
-            } > /tmp/all_listed.tsv
-          fi
-      
-          echo "📄 Raw symbol rows: $(wc -l < /tmp/all_listed.tsv)"
-      
-          # ---------- Build symbol_db.json (Bash + jq) ----------
-          norm() {
-            echo "$1" \
-              | sed 's/[™®©]//g' \
-              | sed 's/[“”"()]//g' \
-              | sed 's/&/ and /g' \
-              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/[^A-Za-z0-9_.\- ]/ /g' \
-              | tr '[:upper:]' '[:lower:]' \
-              | sed -E 's/ +/ /g; s/^ +| +$//g'
-          }
-      
-          map_exch() {
-            case "$1" in
-              NASDAQ|Nasdaq|NasdaqGS|NasdaqGM|NasdaqCM) echo "NASDAQ" ;;
-              NYSE|New\ York\ Stock\ Exchange) echo "NYSE" ;;
-              NYSE\ American|AMEX|Amex) echo "NYSE American" ;;
-              NYSE\ Arca|Arca) echo "NYSE Arca" ;;
-              "" ) echo "" ;;
-              * ) echo "$1" ;;
-            esac
-          }
-      
-          JSONL=/tmp/sym_records.jsonl
-          : > "$JSONL"
-      
-          while IFS=$'\t' read -r SYM NAME EXCH; do
-            [ -z "${SYM:-}" ] && continue
-            [ -z "${NAME:-}" ] && continue
-            EXD=$(map_exch "${EXCH:-}")
-            key=$(norm "$NAME")
-            if [ -n "$key" ]; then
-              printf '{"k":%s,"t":%s,"e":%s}\n' \
-                "$(jq -Rs . <<<"$key")" \
-                "$(jq -Rs . <<<"$SYM")" \
-                "$(jq -Rs . <<<"$EXD")" >> "$JSONL"
-            fi
-            clean=$(echo "$NAME" | sed -E 's/[^A-Za-z0-9_.\- ]/ /g' | sed -E 's/ +/ /g')
-            first_two=$(echo "$clean" | awk '{print $1" "$2}')
-            alt1=$(norm "$first_two")
-            if [ -n "$alt1" ]; then
-              printf '{"k":%s,"t":%s,"e":%s}\n' \
-                "$(jq -Rs . <<<"$alt1")" \
-                "$(jq -Rs . <<<"$SYM")" \
-                "$(jq -Rs . <<<"$EXD")" >> "$JSONL"
-            fi
-            first=$(echo "$clean" | awk '{print $1}')
-            alt2=$(norm "$first")
-            if [ -n "$alt2" ]; then
-              printf '{"k":%s,"t":%s,"e":%s}\n' \
-                "$(jq -Rs . <<<"$alt2")" \
-                "$(jq -Rs . <<<"$SYM")" \
-                "$(jq -Rs . <<<"$EXD")" >> "$JSONL"
-            fi
-          done < /tmp/all_listed.tsv
-      
-          jq -s 'reduce .[] as $r ({}; if has($r.k) then . else .[$r.k] = {ticker:$r.t, exchange:$r.e} end)' "$JSONL" \
-            > .cache/symbol_db.json
-      
-          date -u +%F > .cache/symbol_db.stamp
-          echo "✅ Symbol DB entries: $(jq 'keys|length' .cache/symbol_db.json)"
 
+          INPUT_FILE="data/symbols.csv"
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "❌ $INPUT_FILE not found. Please add it to your repo."
+            exit 1
+          fi
 
+          # Write a tiny Python script to parse CSV safely and build symbol_db.json
+          cat > /tmp/build_symbol_db.py <<'PY'
+import csv, json, re, sys
+from pathlib import Path
+
+inp = Path("data/symbols.csv")
+if not inp.exists():
+    print("Missing data/symbols.csv", file=sys.stderr)
+    sys.exit(1)
+
+def norm(s: str) -> str:
+    s = re.sub(r'[™®©]', '', s or '')
+    s = re.sub(r'[“”"()]', '', s)
+    s = s.replace('&', ' and ')
+    s = re.sub(r'\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?', '', s, flags=re.I)
+    s = re.sub(r'[^0-9A-Za-z_. \-]+', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip().lower()
+    return s
+
+db = {}
+with inp.open('r', encoding='utf-8', newline='') as f:
+    reader = csv.DictReader(f)
+    # Expect at least "Symbol" and "Name" columns
+    for row in reader:
+        sym = (row.get('Symbol') or '').strip()
+        name = (row.get('Name') or '').strip()
+        if not sym or not name:
+            continue
+        key = norm(name)
+        if key and key not in db:
+            db[key] = {"ticker": sym}
+        # helpful alternates: first two tokens, first token
+        clean = re.sub(r'[^0-9A-Za-z_. \-]+', ' ', name)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        toks = clean.split()
+        if toks:
+            alt1 = norm(' '.join(toks[:2]))
+            if alt1 and alt1 not in db:
+                db[alt1] = {"ticker": sym}
+            alt2 = norm(toks[0])
+            if alt2 and alt2 not in db:
+                db[alt2] = {"ticker": sym}
+
+# Dump to cache
+Path(".cache/symbol_db.json").write_text(json.dumps(db), encoding='utf-8')
+print(f"Built {len(db)} keys", file=sys.stderr)
+PY
+
+          python3 /tmp/build_symbol_db.py
+          echo "✅ Built symbol DB with $(jq 'keys|length' .cache/symbol_db.json) entries"
+
+      # ===== Parse feeds + PRN filter (using your local symbol DB) =====
       - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
         env:
           SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
@@ -206,8 +112,9 @@ jobs:
           SLACK_WEBHOOK_CONTRACTS: ${{ secrets.SLACK_WEBHOOK_CONTRACTS }}
         run: |
           set -euo pipefail
+          export LC_ALL=C
 
-          # ---------- Helpers ----------
+          # Helpers
           safe_xpath() { xmllint --xpath "string($2)" "$1" 2>/dev/null || true; }
 
           FEEDS=(
@@ -229,7 +136,7 @@ jobs:
           CURRENT_TIME=$(date -u +%s)
           TEN_MINUTES_AGO=$((CURRENT_TIME - WINDOW_SEC))
 
-          # Prune rolling 10-min headline cache (format: "<epoch> <headline_hash>")
+          # prune rolling 10-min cache ("<epoch> <headline_hash>")
           awk -v cutoff="$TEN_MINUTES_AGO" '{
             if (NF >= 2) { epoch=$1; if (epoch ~ /^[0-9]+$/ && epoch >= cutoff) print $0; }
           }' .cache/last_10min_articles.txt > .cache/_pruned.tmp || true
@@ -241,8 +148,9 @@ jobs:
               | sed 's/[“”"'\''()]//g' \
               | sed 's/&/ and /g' \
               | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/ +/ /g; s/^ +| +$//g' \
-              | tr '[:upper:]' '[:lower:]'
+              | sed -E 's/[^[:alnum:]_. -]/ /g' \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/ +/ /g; s/^ +| +$//g'
           }
 
           extract_candidates() {
@@ -261,29 +169,22 @@ jobs:
           }
 
           resolve_company_local() {
-            # returns JSON {"ticker": "...", "exchange": "..."} or {"ticker":null}
             local raw="$1"
             local key=$(norm_company_name "$raw")
             local hit
             hit=$(jq -cr --arg k "$key" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
-            if [ "$hit" != "null" ] && [ -n "$hit" ]; then
-              echo "$hit"; return 0
-            fi
-            # Try progressive shortening (drop last token)
+            if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
+            # progressive shortening (drop last token)
             local words=($key)
             while [ ${#words[@]} -gt 1 ]; do
               unset 'words[${#words[@]}-1]'
-              k2="${words[*]}"
-              k2=$(echo "$k2" | sed -E 's/ +/ /g')
+              k2="${words[*]}"; k2=$(echo "$k2" | sed -E 's/ +/ /g')
               hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
-              if [ "$hit" != "null" ] && [ -n "$hit" ]; then
-                echo "$hit"; return 0
-              fi
+              if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
             done
-            echo '{"ticker":null,"exchange":null}'
+            echo '{"ticker":null}'
           }
 
-          # ---------- MAIN LOOP ----------
           NEW_ARTICLE_FOUND=false
 
           for FEED_URL in "${FEEDS[@]}"; do
@@ -292,7 +193,7 @@ jobs:
             XML_FILE=$(mktemp)
             curl -sL "$FEED_URL" > "$XML_FILE" || true
             if [ ! -s "$XML_FILE" ]; then
-              echo "⚠️  Empty response from feed."
+              echo "⚠️ Empty response."
               rm -f "$XML_FILE"
               continue
             fi
@@ -320,7 +221,7 @@ jobs:
 
               HEADLINE_HASH=$(echo -n "$TITLE" | md5sum | cut -d ' ' -f1)
               if grep -qx "$HEADLINE_HASH" <(awk '{print $2}' .cache/last_10min_articles.txt); then
-                echo "🔁 Skipping duplicate headline (10-min window): $TITLE"
+                echo "🔁 Skipping duplicate (10-min window): $TITLE"
                 continue
               fi
 
@@ -334,21 +235,20 @@ jobs:
                 continue
               fi
 
-              # --- US-listing filter for PR Newswire ONLY (local DB) ---
+              # PR Newswire filter: require company match in local DB
               if [ "$FEED_URL" = "$PRN_FEED" ]; then
                 cand=$(extract_candidates "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
                 if [ -z "$cand" ]; then
-                  echo "🇺🇸⛔ Skipping PRN (no company candidate): $TITLE"
+                  echo "🇺🇸⛔ PRN skip (no company candidate): $TITLE"
                   continue
                 fi
                 info_json=$(resolve_company_local "$cand")
-                exch=$(jq -r '.exchange // empty' <<<"$info_json")
                 ticker=$(jq -r '.ticker // empty' <<<"$info_json")
-                if ! echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
-                  echo "🇺🇸⛔ Skipping PRN (not US-listed or unresolved): $TITLE (cand: $cand)"
+                if [ -z "$ticker" ]; then
+                  echo "🇺🇸⛔ PRN skip (not in local US list): $TITLE (cand: $cand)"
                   continue
                 fi
-                echo "🇺🇸✅ PRN US-listed: $TITLE (cand: $cand, $ticker / $exch)"
+                echo "🇺🇸✅ PRN US-listed: $TITLE (cand: $cand, $ticker)"
               fi
 
               # Categorize
@@ -411,10 +311,11 @@ jobs:
             echo "✅ No new articles in the last 10 minutes."
           fi
 
-      # ===== Manual PRN-style headline test against local symbol DB =====
+      # ===== Manual PRN-style headline test against your local DB =====
       - name: Manual headline extractor + local DB lookup test
         run: |
           set -euo pipefail
+          export LC_ALL=C
 
           norm_company_name() {
             echo "$1" \
@@ -422,8 +323,9 @@ jobs:
               | sed 's/[“”"'\''()]//g' \
               | sed 's/&/ and /g' \
               | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/ +/ /g; s/^ +| +$//g' \
-              | tr '[:upper:]' '[:lower:]'
+              | sed -E 's/[^[:alnum:]_. -]/ /g' \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/ +/ /g; s/^ +| +$//g'
           }
 
           extract_candidates() {
@@ -454,7 +356,7 @@ jobs:
               hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
               if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
             done
-            echo '{"ticker":null,"exchange":null}'
+            echo '{"ticker":null}'
           }
 
           echo "📰 Testing extractor + local DB…"
@@ -475,48 +377,11 @@ jobs:
             echo "   → Candidate: ${cand:-<none>}"
             if [ -z "${cand:-}" ]; then echo "   → ❌ no candidate"; echo "---------------------------------"; continue; fi
             info_json=$(resolve_company_local "$cand")
-            exch=$(jq -r '.exchange // empty' <<<"$info_json")
             ticker=$(jq -r '.ticker // empty' <<<"$info_json")
-            if [ -n "$ticker" ] && echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
-              echo "   → ✅ $ticker / $exch"
+            if [ -n "$ticker" ]; then
+              echo "   → ✅ $ticker (in your local US list)"
             else
-              echo "   → ❌ not US-listed or unresolved"
+              echo "   → ❌ not found in your local list"
             fi
             echo "---------------------------------"
           done
-
-      # ===== Inventory inspection & publishing =====
-      - name: Inspect company inventory (summary)
-        run: |
-          if [ ! -f .cache/company_index.json ]; then
-            echo "No inventory file yet."; exit 0;
-          fi
-          echo "📦 company_index.json"
-          ls -lh .cache/company_index.json
-          echo "Total entries:"
-          jq 'keys | length' .cache/company_index.json
-          echo "Sample (first 10 positives):"
-          jq -r '[ to_entries[] | select(.value.ticker != null) ][0:10]' .cache/company_index.json
-
-      - name: Inventory summary (Job Summary)
-        run: |
-          if [ ! -f .cache/company_index.json ]; then
-            echo "No inventory yet" >> "$GITHUB_STEP_SUMMARY"; exit 0;
-          fi
-          POS=$(jq '[ to_entries[] | select(.value.ticker != null and .value.exchange != null) ] | length' .cache/company_index.json)
-          NEG=$(jq '[ to_entries[] | select(.value.ticker == null or .value.exchange == null) ] | length' .cache/company_index.json)
-          {
-            echo "### Company Inventory Summary"
-            echo ""
-            echo "| Metric | Count |"
-            echo "|---|---:|"
-            echo "| Positives (ticker found) | $POS |"
-            echo "| Negatives (no match) | $NEG |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Publish company inventory (artifact)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: company-index
-          path: .cache/company_index.json
