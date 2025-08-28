@@ -39,50 +39,54 @@ jobs:
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      - name: Build symbol database from local TSV (no awk/heredoc)
+      - name: Build symbol database from local TSV (bash+jq)
         shell: bash
         run: |
           set -euo pipefail
-          export LC_ALL=C
           mkdir -p .cache
       
-          INPUT_FILE="data/symbols.csv"   # your tab-separated file (can be .tsv)
+          INPUT_FILE="data/symbols.csv"   # tab-separated file
           if [ ! -f "$INPUT_FILE" ]; then
             echo "❌ $INPUT_FILE not found."
             exit 1
           fi
       
-          # Parse TSV → JSON rows, then normalize & build key→ticker map with alternates
-          mlr --itsv --ojson cat "$INPUT_FILE" \
-          | jq -s '
-              def norm:
-                gsub("[™®©]"; "") |
-                gsub("[“”\"()]"; "") |
-                gsub("&"; " and ") |
-                gsub("\\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\\.?A\\.?)\\b\\.?\\,?"; "") |
-                gsub("[^0-9A-Za-z_. \\-]"; " ") |
-                gsub("\\s+"; " ") |
-                ltrimstr(" ") | rtrimstr(" ") |
-                ascii_downcase;
+          # Reset output
+          echo '{}' > .cache/symbol_db.json
       
-              reduce .[] as $r ({}; 
-                if (($r.Symbol // "") != "" and ($r.Name // "") != "") then
-                  ($r.Name | norm) as $key
-                  | ($r.Name
-                      | gsub("[^0-9A-Za-z_. \\-]"; " ")
-                      | gsub("\\s+"; " ")
-                      | ltrimstr(" ") | rtrimstr(" ")
-                      | ascii_downcase) as $clean
-                  | ($clean | split(" ") | .[0:2] | join(" ") | norm) as $alt1
-                  | ($clean | split(" ") | (.[0] // "") | norm) as $alt2
-                  | .[$key] = {ticker: $r.Symbol}
-                  | (if ($alt1|length)>0 and (has($alt1)|not) then .[$alt1] = {ticker: $r.Symbol} else . end)
-                  | (if ($alt2|length)>0 and (has($alt2)|not) then .[$alt2] = {ticker: $r.Symbol} else . end)
-                else . end
-              )
-            ' > .cache/symbol_db.json
+          norm() {
+            echo "$1" \
+              | sed 's/[™®©]//g' \
+              | sed 's/[“”"()]//g' \
+              | sed 's/&/ and /g' \
+              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
+              | sed -E 's/[^0-9A-Za-z_. -]/ /g' \
+              | tr '[:upper:]' '[:lower:]' \
+              | sed -E 's/ +/ /g; s/^ +| +$//g'
+          }
+      
+          # Read TSV line by line, skipping header
+          tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name rest; do
+            [ -z "$sym" ] && continue
+            [ -z "$name" ] && continue
+      
+            key=$(norm "$name")
+            alt1=$(echo "$name" | awk '{print $1,$2}' | norm)
+            alt2=$(echo "$name" | awk '{print $1}' | norm)
+      
+            for k in "$key" "$alt1" "$alt2"; do
+              [ -z "$k" ] && continue
+              # Insert into JSON if not already present
+              tmp=$(mktemp)
+              jq --arg k "$k" --arg t "$sym" \
+                 'if has($k) then . else .[$k] = {ticker:$t} end' \
+                 .cache/symbol_db.json > "$tmp" && mv "$tmp" .cache/symbol_db.json
+            done
+          done
       
           echo "✅ Built symbol DB with $(jq 'keys|length' .cache/symbol_db.json) entries"
+
+
 
       # ===== Parse feeds + PRN filter (using your local symbol DB) =====
       - name: Parse RSS Feeds, filter PRN via local DB, and Post to Slack
