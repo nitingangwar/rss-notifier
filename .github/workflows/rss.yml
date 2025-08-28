@@ -40,15 +40,14 @@ jobs:
           [ -f .cache/symbols.sha256 ]   || : > .cache/symbols.sha256
           [ -f .cache/negative_prn.json ] || echo '{}' > .cache/negative_prn.json
 
-      # Build key→ticker map from your TAB-separated data/symbols.csv
+      # Build key→ticker map from your TAB-separated data/symbols.csv (uses 1–4 word prefixes)
       - name: Build symbol lookup (rebuild only if TSV changed)
         shell: bash
         run: |
           set -euo pipefail
-          INPUT_FILE="data/symbols.csv"   # tab-separated; header row contains "Symbol<TAB>Name"
+          INPUT_FILE="data/symbols.csv"   # TAB-separated; header row; first two cols: Symbol, Name
           if [ ! -f "$INPUT_FILE" ]; then
-            echo "❌ Missing $INPUT_FILE (tab-separated file with header)."
-            exit 1
+            echo "❌ Missing $INPUT_FILE (tab-separated)."; exit 1
           fi
 
           NEW_HASH="$(sha256sum "$INPUT_FILE" | awk '{print $1}')"
@@ -59,44 +58,27 @@ jobs:
             exit 0
           fi
 
-          echo "🔄 Rebuilding lookup from symbols.csv…"
+          echo "🔄 Rebuilding lookup from symbols.csv (prefix keys 1..4 words)…"
           KT=/tmp/key_ticker.tsv
           : > "$KT"
-
-          norm() {
-            local s="${1:-}"
-            s="$(printf '%s' "$s" \
-              | sed 's/[™®©]//g' \
-              | sed 's/[“”"()]//g' \
-              | sed 's/&/ and /g' \
-              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/[^0-9A-Za-z_. -]/ /g' \
-              | tr '[:upper:]' '[:lower:]' \
-              | sed -E 's/ +/ /g; s/^ +| +$//g')"
-            printf '%s' "$s"
-          }
 
           # Read first two columns: Symbol<TAB>Name<…>
           tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name _; do
             [ -n "${sym:-}" ] || continue
             [ -n "${name:-}" ] || continue
-
-            # full normalized name
-            key="$(norm "$name")"
-            [ -n "$key" ] && printf '%s\t%s\n' "$key" "$sym" >> "$KT"
-
-            # alternates: first two words, and first word
-            # shell word-split is fine because we normalize later
-            words=($name)
-            w1="${words[0]:-}"; w2="${words[1]:-}"
-            if [ -n "$w1" ]; then
-              alt_first="$(norm "$w1")"
-              [ -n "$alt_first" ] && printf '%s\t%s\n' "$alt_first" "$sym" >> "$KT"
-            fi
-            if [ -n "$w1" ] && [ -n "$w2" ]; then
-              alt_two="$(norm "$w1 $w2")"
-              [ -n "$alt_two" ] && printf '%s\t%s\n' "$alt_two" "$sym" >> "$KT"
-            fi
+            # collapse spaces
+            name="$(printf '%s' "$name" | tr -s '[:space:]' ' ')"
+            # tokenize by space (keep + and &)
+            read -r -a TOKS <<<"$name"
+            for n in 1 2 3 4; do
+              [ ${#TOKS[@]} -ge $n ] || break
+              prefix="${TOKS[*]:0:$n}"
+              key="$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g; s/^ +| +$//g')"
+              [ -n "$key" ] && printf '%s\t%s\n' "$key" "$sym" >> "$KT"
+              # safety variant: +/& → "and"
+              key_and="$(printf '%s' "$key" | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g')"
+              [ "$key_and" != "$key" ] && printf '%s\t%s\n' "$key_and" "$sym" >> "$KT"
+            done
           done
 
           jq -Rs '
@@ -133,7 +115,7 @@ jobs:
           PER_FEED_ITEMS=3
           WINDOW_SEC=600
           CURRENT_TIME=$(date -u +%s)
-          CUT10=$((CURRENT_TIME - WINDOW_SEC))
+          CUTOFF=$((CURRENT_TIME - WINDOW_SEC))
 
           NEG_CACHE=".cache/negative_prn.json"
           is_negative_cached() {
@@ -154,21 +136,16 @@ jobs:
 
           safe_xpath() { xmllint --xpath "string($2)" "$1" 2>/dev/null || true; }
 
-          norm_company_name() {
-            echo "$1" \
-              | sed 's/[™®©]//g' \
-              | sed 's/[“”"'\''()]//g' \
-              | sed 's/&/ and /g' \
-              | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
-              | sed -E 's/[^0-9A-Za-z_. -]/ /g' \
-              | tr '[:upper:]' '[:lower:]' \
-              | sed -E 's/ +/ /g; s/^ +| +$//g'
-          }
-
+          # super-light resolver: lowercase+trim; try raw, then +/& → and
           resolve_company_local() {
-            local raw="$1"
-            local key=$(norm_company_name "$raw")
-            jq -cr --arg k "$key" 'if has($k) then .[$k] else {"ticker":null,"exchange":null} end' .cache/symbol_db.json
+            local raw="$1" k hit
+            k="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g; s/^ +| +$//g')"
+            hit=$(jq -cr --arg k "$k" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
+            if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
+            k2="$(printf '%s' "$k" | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g')"
+            hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
+            if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
+            echo '{"ticker":null}'
           }
 
           extract_chunk_before_verb() {
@@ -181,9 +158,8 @@ jobs:
               verbs="announces announce launches launch reports report unveils introduces reveals confirms completes signs wins awarded enters partners acquires files prices lists successfully passes secures appoints names extends expands approves approved"
               split(verbs,V," ")
               for(i=1;i<=n;i++){
-                wl=tolower($i)
-                if(wl in V) break
-                if($i ~ /^[A-Z][A-Za-z0-9.-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){
+                wl=tolower($i); if(wl in V) break
+                if($i ~ /^[A-Z][A-Za-z0-9.+&-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){
                   chunk = (length(chunk)?chunk" ":"") $i
                 } else if(length(chunk)>0) break
               }
@@ -219,7 +195,7 @@ jobs:
               CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
 
               ARTICLE_TIME=$(date -d "$PUBDATE" +%s 2>/dev/null || echo 0)
-              if [ "$ARTICLE_TIME" -eq 0 ] || [ "$ARTICLE_TIME" -lt "$CUT10" ]; then
+              if [ "$ARTICLE_TIME" -eq 0 ] || [ "$ARTICLE_TIME" -lt "$CUTOFF" ]; then
                 echo "⏱️ Skipping (outside window): $TITLE"
                 continue
               fi
@@ -239,47 +215,42 @@ jobs:
                 continue
               fi
 
-              # ===== PR Newswire filter =====
-              if [ "$FEED_URL" = "$PRN_FEED" ]; then
-                # 1) try first word (ignore 1-2 letter acronyms unless in DB)
+              # ===== PR Newswire filter (prefix-based) =====
+              if [ "$FEED_URL" = "https://www.prnewswire.com/rss/news-releases-list.rss" ]; then
+                matched=false
+
+                # 1) First word
                 fw=$(echo "$TITLE" | awk '{print $1}')
-                use_fw=true
-                if [ ${#fw} -le 2 ]; then
-                  hit=$(resolve_company_local "$fw"); t=$(jq -r '.ticker // empty' <<<"$hit")
-                  [ -z "$t" ] && use_fw=false
-                fi
-                ticker=""; exch=""; matched=false
-                if [ "$use_fw" = true ]; then
-                  info=$(resolve_company_local "$fw")
-                  ticker=$(jq -r '.ticker // empty' <<<"$info")
-                  exch=$(jq -r '.exchange // empty' <<<"$info")
-                  if [ -n "$ticker" ] && echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
-                    matched=true
-                    fw_key=$(norm_company_name "$fw"); unmark_negative "$fw_key" || true
-                    echo "🇺🇸✅ PRN matched by first word: $TITLE ($fw → $ticker / $exch)"
-                  fi
+                info=$(resolve_company_local "$fw")
+                ticker=$(jq -r '.ticker // empty' <<<"$info")
+                if [ -n "$ticker" ]; then
+                  matched=true
+                  key_fw="$(printf '%s' "$fw" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g')"
+                  unmark_negative "$key_fw" || true
+                  echo "🇺🇸✅ PRN matched by 1-word prefix: $TITLE ($fw → $ticker)"
                 fi
 
-                # 2) fallback: chunk before verb (captures multi-word names like "Hormel Foods")
+                # 2) Fallback: chunk before verb → take its first 2 words
                 if [ "$matched" = false ]; then
-                  cand=$(extract_chunk_before_verb "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
-                  if [ -n "$cand" ]; then
-                    info2=$(resolve_company_local "$cand")
-                    ticker=$(jq -r '.ticker // empty' <<<"$info2")
-                    exch=$(jq -r '.exchange // empty' <<<"$info2")
-                    if [ -n "$ticker" ] && echo "$exch" | grep -Ei '^(NASDAQ|NYSE|NYSE American|NYSE Arca)$' >/dev/null; then
+                  cand_full=$(extract_chunk_before_verb "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
+                  if [ -n "$cand_full" ]; then
+                    cand2="$(printf '%s' "$cand_full" | awk '{print $1" "$2}')"
+                    info2=$(resolve_company_local "$cand2")
+                    ticker2=$(jq -r '.ticker // empty' <<<"$info2")
+                    if [ -n "$ticker2" ]; then
                       matched=true
-                      ck=$(norm_company_name "$cand"); unmark_negative "$ck" || true
-                      echo "🇺🇸✅ PRN matched by chunk: $TITLE ($cand → $ticker / $exch)"
+                      key_c2="$(printf '%s' "$cand2" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g')"
+                      unmark_negative "$key_c2" || true
+                      echo "🇺🇸✅ PRN matched by 2-word prefix: $TITLE ($cand2 → $ticker2)"
                     fi
                   fi
                 fi
 
-                # 3) if still not matched, mark negative (both first word and chunk keys)
+                # 3) If still not matched, cache negative to avoid rework
                 if [ "$matched" = false ]; then
-                  [ -n "${fw:-}" ] && mark_negative "$(norm_company_name "$fw")"
-                  [ -n "${cand:-}" ] && mark_negative "$(norm_company_name "$cand")"
-                  echo "🚫 PRN not in local US list → cached negative: $TITLE (cand: ${cand:-$fw})"
+                  key_neg="$(printf '%s' "${cand_full:-$fw}" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g')"
+                  mark_negative "$key_neg"
+                  echo "🚫 PRN not in local US list → cached negative: $TITLE (cand: ${cand_full:-$fw})"
                   continue
                 fi
               fi
