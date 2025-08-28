@@ -108,7 +108,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          URL="https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
+          URL="https://www.prnewswire.com/rss/news-releases-list.rss"
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
       
           echo "Fetching PRN feed..."
@@ -141,9 +141,9 @@ jobs:
           FEEDS=(
             "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
             "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
-            "https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
+            "https://www.prnewswire.com/rss/news-releases-list.rss"
           )
-          PRN_FEED="https://www.prnewswire.com/rss/all-news-releases-from-PR-newswire-news.rss"
+          PRN_FEED="https://www.prnewswire.com/rss/news-releases-list.rss"
 
           declare -A WEBHOOKS=(
             [general]="${SLACK_WEBHOOK_GENERAL}"
