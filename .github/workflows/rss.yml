@@ -39,13 +39,14 @@ jobs:
           [ -f .cache/last_10min_articles.txt ] || touch .cache/last_10min_articles.txt
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
 
-      - name: Build symbol database from local TSV (bash+jq)
+  
+      - name: Build symbol database from local TSV (bash+jq, no pipes into functions)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p .cache
       
-          INPUT_FILE="data/symbols.csv"   # tab-separated file
+          INPUT_FILE="data/symbols.csv"   # tab-separated file (your pasted table)
           if [ ! -f "$INPUT_FILE" ]; then
             echo "❌ $INPUT_FILE not found."
             exit 1
@@ -55,29 +56,41 @@ jobs:
           echo '{}' > .cache/symbol_db.json
       
           norm() {
-            echo "$1" \
+            # normalize a single string passed as $1
+            local s="${1:-}"
+            s="$(printf '%s' "$s" \
               | sed 's/[™®©]//g' \
               | sed 's/[“”"()]//g' \
               | sed 's/&/ and /g' \
               | sed -E 's/\b(Inc|Incorporated|Corp|Corporation|Co|Company|Ltd|Limited|PLC|Group|Holdings?|LLC|LP|AG|S\.?A\.?)\b\.?,?//Ig' \
               | sed -E 's/[^0-9A-Za-z_. -]/ /g' \
               | tr '[:upper:]' '[:lower:]' \
-              | sed -E 's/ +/ /g; s/^ +| +$//g'
+              | sed -E 's/ +/ /g; s/^ +| +$//g')"
+            printf '%s' "$s"
           }
       
           # Read TSV line by line, skipping header
-          tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name rest; do
-            [ -z "$sym" ] && continue
-            [ -z "$name" ] && continue
+          # We only need first 2 columns: Symbol, Name
+          tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name _; do
+            [ -z "${sym:-}" ] && continue
+            [ -z "${name:-}" ] && continue
       
-            key=$(norm "$name")
-            alt1=$(echo "$name" | awk '{print $1,$2}' | norm)
-            alt2=$(echo "$name" | awk '{print $1}' | norm)
+            key="$(norm "$name")"
+      
+            # First and first-two words (pure bash, no awk/pipes)
+            # shellcheck disable=SC2206
+            words=($name)  # word split on spaces
+            w1="${words[0]:-}"
+            w2="${words[1]:-}"
+            alt1_raw="$w1"
+            [ -n "$w2" ] && alt1_raw="$w1 $w2"
+      
+            alt1="$(norm "$alt1_raw")"
+            alt2="$(norm "$w1")"
       
             for k in "$key" "$alt1" "$alt2"; do
               [ -z "$k" ] && continue
-              # Insert into JSON if not already present
-              tmp=$(mktemp)
+              tmp="$(mktemp)"
               jq --arg k "$k" --arg t "$sym" \
                  'if has($k) then . else .[$k] = {ticker:$t} end' \
                  .cache/symbol_db.json > "$tmp" && mv "$tmp" .cache/symbol_db.json
