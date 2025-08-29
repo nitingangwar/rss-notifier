@@ -37,16 +37,15 @@ jobs:
           [ -f .cache/sent_hashes.txt ] || : > .cache/sent_hashes.txt
           [ -f .cache/last_10min_articles.txt ] || : > .cache/last_10min_articles.txt
           [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
-          [ -f .cache/symbols.sha256 ]   || : > .cache/symbols.sha256
+          [ -f .cache/symbols.sha256 ] || : > .cache/symbols.sha256
           [ -f .cache/negative_prn.json ] || echo '{}' > .cache/negative_prn.json
 
-
-      # Build key→ticker map from your TAB-separated data/symbols.csv (uses 1–4 word prefixes)
+      # Build key→ticker map from your TAB-separated data/symbols.csv (1–4 word prefixes)
       - name: Build symbol lookup (rebuild only if TSV changed)
         shell: bash
         run: |
           set -euo pipefail
-          INPUT_FILE="data/symbols.csv"   # TAB-separated; header row; first two cols: Symbol, Name
+          INPUT_FILE="data/symbols.csv"   # TAB-separated; header; first 2 cols: Symbol, Name
           if [ ! -f "$INPUT_FILE" ]; then
             echo "❌ Missing $INPUT_FILE (tab-separated)."; exit 1
           fi
@@ -67,16 +66,14 @@ jobs:
           tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name _; do
             [ -n "${sym:-}" ] || continue
             [ -n "${name:-}" ] || continue
-            # collapse spaces
             name="$(printf '%s' "$name" | tr -s '[:space:]' ' ')"
-            # tokenize by space (keep + and &)
             read -r -a TOKS <<<"$name"
             for n in 1 2 3 4; do
               [ ${#TOKS[@]} -ge $n ] || break
               prefix="${TOKS[*]:0:$n}"
               key="$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g; s/^ +| +$//g')"
               [ -n "$key" ] && printf '%s\t%s\n' "$key" "$sym" >> "$KT"
-              # safety variant: +/& → "and"
+              # variant: +/& → "and"
               key_and="$(printf '%s' "$key" | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g')"
               [ "$key_and" != "$key" ] && printf '%s\t%s\n' "$key_and" "$sym" >> "$KT"
             done
@@ -96,6 +93,7 @@ jobs:
           SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
           SLACK_WEBHOOK_MEDICAL: ${{ secrets.SLACK_WEBHOOK_MEDICAL }}
           SLACK_WEBHOOK_CONTRACTS: ${{ secrets.SLACK_WEBHOOK_CONTRACTS }}
+          SLACK_WEBHOOK_EARNINGS: ${{ secrets.SLACK_WEBHOOK_EARNINGS }}
         shell: bash
         run: |
           set -euo pipefail
@@ -111,9 +109,9 @@ jobs:
             [general]="${SLACK_WEBHOOK_GENERAL}"
             [medical]="${SLACK_WEBHOOK_MEDICAL}"
             [contracts]="${SLACK_WEBHOOK_CONTRACTS}"
+            [earnings]="${SLACK_WEBHOOK_EARNINGS}"
           )
 
-          PER_FEED_ITEMS=3
           WINDOW_SEC=600
           CURRENT_TIME=$(date -u +%s)
           CUTOFF=$((CURRENT_TIME - WINDOW_SEC))
@@ -155,8 +153,8 @@ jobs:
             [ -z "$pre" ] && pre="$title"
             pre=$(echo "$pre" | sed 's/[“”"()™®©]//g' | tr -s ' ')
             awk '{
-              n=NF; chunk="";
-              verbs="announces announce launches launch reports report unveils introduces reveals confirms completes signs wins awarded enters partners acquires files prices lists successfully passes secures appoints names extends expands approves approved"
+              n=NF; chunk=""
+              verbs="reports report announces announce launches launch unveils introduces reveals confirms completes signs wins awarded enters partners acquires files prices lists successfully passes secures appoints names extends expands approves approved"
               split(verbs,V," ")
               for(i=1;i<=n;i++){
                 wl=tolower($i); if(wl in V) break
@@ -166,6 +164,13 @@ jobs:
               }
               print chunk
             }' <<<"$pre"
+          }
+
+          is_earnings_title() {
+            # conservative: catches quarter/fiscal/earnings/call/EPS patterns
+            local t="$1"
+            echo "$t" | grep -Eqi \
+              '(^|[[:space:][:punct:]])(reports?|announces?) ([[:alpha:]]+ )?(first|second|third|fourth|q[1-4]) (quarter|results|earnings)|(^|[[:space:][:punct:]])fiscal [0-9]{4} (results|earnings)|(^|[[:space:][:punct:]])earnings (results|release|call)|(^|[[:space:][:punct:]])q[1-4] (results|earnings)|(^|[[:space:][:punct:]])eps([[:space:][:punct:]]|$)'
           }
 
           NEW_ARTICLE_FOUND=false
@@ -181,8 +186,9 @@ jobs:
               continue
             fi
 
+            # iterate all items; filter by time window inside loop
             ITEMS=$(xmllint --xpath 'count(//item | //entry)' "$XML_FILE" 2>/dev/null || echo 0)
-            ITEMS=${ITEMS%.*} 
+            ITEMS=${ITEMS%.*}
 
             for i in $(seq 1 "$ITEMS"); do
               LINK=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href")
@@ -200,27 +206,24 @@ jobs:
 
               ARTICLE_TIME=$(date -d "$PUBDATE" +%s 2>/dev/null || echo 0)
               if [ "$ARTICLE_TIME" -eq 0 ] || [ "$ARTICLE_TIME" -lt "$CUTOFF" ]; then
-                echo "⏱️ Skipping (outside window): $TITLE"
+                # outside last 10 minutes
                 continue
               fi
 
               HEADLINE_HASH=$(echo -n "$TITLE" | md5sum | cut -d ' ' -f1)
               if grep -qx "$HEADLINE_HASH" <(awk '{print $2}' .cache/last_10min_articles.txt); then
-                echo "🔁 Skipping duplicate headline (10-min window): $TITLE"
                 continue
               fi
               LINK_HASH=$(echo -n "$LINK" | md5sum | cut -d ' ' -f1)
               if grep -qx "$LINK_HASH" .cache/sent_hashes.txt; then
-                echo "🧭 Already sent (by link): $TITLE"
                 continue
               fi
               if grep -qx "$HEADLINE_HASH" .cache/sent_hashes.txt; then
-                echo "🧭 Already sent (by headline): $TITLE"
                 continue
               fi
 
-              # ===== PR Newswire filter (prefix-based) =====
-              if [ "$FEED_URL" = "https://www.prnewswire.com/rss/news-releases-list.rss" ]; then
+              # ===== PR Newswire US-company filter (prefix-based) =====
+              if [ "$FEED_URL" = "$PRN_FEED" ]; then
                 matched=false
 
                 # 1) First word
@@ -234,7 +237,7 @@ jobs:
                   echo "🇺🇸✅ PRN matched by 1-word prefix: $TITLE ($fw → $ticker)"
                 fi
 
-                # 2) Fallback: chunk before verb → take its first 2 words
+                # 2) Fallback: chunk before verb → first 2 words
                 if [ "$matched" = false ]; then
                   cand_full=$(extract_chunk_before_verb "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
                   if [ -n "$cand_full" ]; then
@@ -260,16 +263,21 @@ jobs:
               fi
               # ===== end PRN filter =====
 
-              # Category
-              if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
-                CATEGORY="medical"
-              elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
-                CATEGORY="contracts"
+              # ===== Earnings routing (send ONLY to earnings channel) =====
+              if is_earnings_title "$TITLE" || is_earnings_title "$DESCRIPTION"; then
+                CATEGORY="earnings"
               else
-                CATEGORY="general"
+                # Non-earnings categorization
+                if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
+                  CATEGORY="medical"
+                elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
+                  CATEGORY="contracts"
+                else
+                  CATEGORY="general"
+                fi
               fi
 
-              # Sentiment
+              # Sentiment + naive recommendation
               if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
                 SENTIMENT=":large_green_circle: [POSITIVE]"; RECOMMENDATION="BUY"
               elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
@@ -298,7 +306,9 @@ jobs:
                   ]
                 }')
 
-              curl -s -X POST "${WEBHOOKS[$CATEGORY]}" -H 'Content-type: application/json' --data "$PAYLOAD" >/dev/null || true
+              curl -s -X POST "${WEBHOOKS[$CATEGORY]}" \
+                -H 'Content-type: application/json' \
+                --data "$PAYLOAD" >/dev/null || true
 
               echo "$LINK_HASH" >> .cache/sent_hashes.txt
               echo "$HEADLINE_HASH" >> .cache/sent_hashes.txt
