@@ -1,404 +1,94 @@
-name: Categorized RSS Alerts with Sentiment
+- name: Build symbol lookup (from symbols.csv via Python)
+  shell: bash
+  run: |
+    set -euo pipefail
+    INPUT_FILE="data/symbols.csv"   # update if your file lives elsewhere
+    if [ ! -f "$INPUT_FILE" ]; then
+      echo "❌ Missing $INPUT_FILE"; exit 1
+    fi
 
-on:
-  workflow_dispatch: {}
-  # schedule:
-  #   - cron: "*/10 * * * *"
+    NEW_HASH="$(sha256sum "$INPUT_FILE" | awk '{print $1}')"
+    OLD_HASH="$(cat .cache/symbols.sha256 || true)"
 
-concurrency:
-  group: rss-alerts
-  cancel-in-progress: false
+    if [ "$NEW_HASH" = "$OLD_HASH" ] && [ -s .cache/symbol_db.json ]; then
+      echo "🟢 symbols.csv unchanged; keys: $(jq 'keys|length' .cache/symbol_db.json)"
+      exit 0
+    fi
 
-jobs:
-  notify:
-    runs-on: ubuntu-latest
+    echo "🔄 Rebuilding lookup from symbols.csv using Python (auto-detect delimiter; 1..4 word prefixes)…"
 
-    steps:
-      - name: Set up environment
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxml2-utils w3m jq curl coreutils
+    python3 - <<'PY' > .cache/symbol_db.json
+import csv, json, sys, hashlib
+from pathlib import Path
 
-      - name: Checkout repo (to read data files)
-        uses: actions/checkout@v4
+inp = Path("data/symbols.csv")
+raw = inp.read_bytes()
+# Robust: strip BOM if present
+if raw.startswith(b'\xef\xbb\xbf'):
+    raw = raw[3:]
+text = raw.decode('utf-8', errors='replace')
 
-      # ---------- Weekly rotating cache key (prevents bloat) ----------
-      - name: Week stamp
-        id: stamp
-        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+# Auto-detect delimiter
+sniffer = csv.Sniffer()
+dialect = sniffer.sniff(text.splitlines()[0] if '\n' in text else text, delimiters='\t,;')
+reader = csv.reader(text.splitlines(), dialect)
 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: .cache
-          key: rss-cache-v3-${{ runner.os }}-w${{ steps.stamp.outputs.week }}
-          restore-keys: |
-            rss-cache-v3-${{ runner.os }}-
+rows = list(reader)
+if not rows:
+    print(json.dumps({}))
+    sys.exit(0)
 
-      # ---------- Ensure cache & prune rolling window ----------
-      - name: Ensure cache files
-        run: |
-          mkdir -p .cache
-          : > .cache/sent_link_hashes.txt
-          : > .cache/sent_title_hashes.txt
-          [ -f .cache/last_10min_articles.txt ] || : > .cache/last_10min_articles.txt
-          [ -f .cache/symbol_db.json ] || echo '{}' > .cache/symbol_db.json
-          [ -f .cache/symbols.sha256 ] || : > .cache/symbols.sha256
-          [ -f .cache/negative_prn.json ] || echo '{}' > .cache/negative_prn.json
-          [ -f .cache/important_keys.json ] || echo '[]' > .cache/important_keys.json
-          [ -f .cache/important.sha256 ] || : > .cache/important.sha256
+# Find header (or assume first row is header if it looks like one)
+header = rows[0]
+lower = [h.strip().lower() for h in header]
+has_header = ('symbol' in lower and ('name' in lower or 'company' in lower or 'company name' in lower))
+start = 1 if has_header else 0
 
-          # prune the 10-minute window file
-          NOW=$(date -u +%s)
-          CUTOFF=$((NOW - 600))
-          awk -v cutoff="$CUTOFF" 'NF>=2 { if ($1 ~ /^[0-9]+$/ && $1 >= cutoff) print $0 }' \
-            .cache/last_10min_articles.txt > .cache/_pruned || true
-          mv .cache/_pruned .cache/last_10min_articles.txt
+# Determine column indices
+def idx_of(cands):
+    for c in cands:
+        if c in lower:
+            return lower.index(c)
+    return None
 
-      # ---------- Build symbol lookup from data/symbols.csv (prefix 1..4) ----------
-      - name: Build symbol lookup (from TSV)
-        shell: bash
-        run: |
-          set -euo pipefail
-          INPUT_FILE="data/symbols.csv"   # TAB-separated; header; first 2 cols: Symbol, Name
-          if [ ! -f "$INPUT_FILE" ]; then
-            echo "❌ Missing $INPUT_FILE (tab-separated: Symbol<TAB>Name<...>)."; exit 1
-          fi
+sym_idx = idx_of(['symbol', 'ticker', 'ticker symbol'])
+name_idx = idx_of(['name', 'company', 'company name', 'security name'])
 
-          NEW_HASH="$(sha256sum "$INPUT_FILE" | awk '{print $1}')"
-          OLD_HASH="$(cat .cache/symbols.sha256 || true)"
+# If no header or columns not found, assume col0=symbol, col1=name
+if sym_idx is None or name_idx is None:
+    sym_idx, name_idx = 0, 1
 
-          if [ "$NEW_HASH" = "$OLD_HASH" ] && [ -s .cache/symbol_db.json ]; then
-            echo "🟢 symbols.csv unchanged; keys: $(jq 'keys|length' .cache/symbol_db.json)"
-            exit 0
-          fi
+db = {}
+def norm_key(s: str) -> str:
+    s = s.replace('\u00a0',' ').strip()
+    s = ' '.join(s.split())
+    return s.lower()
 
-          echo "🔄 Rebuilding lookup from symbols.csv (1..4 word prefixes)…"
-          KT=/tmp/key_ticker.tsv
-          : > "$KT"
+# Build 1..4 word prefix keys
+for r in rows[start:]:
+    if len(r) <= max(sym_idx, name_idx): 
+        continue
+    sym = r[sym_idx].strip()
+    name = r[name_idx].strip()
+    if not sym or not name:
+        continue
+    toks = [t for t in name.replace('\u00a0',' ').split() if t]
+    for n in (1,2,3,4):
+        if len(toks) < n: break
+        pref = ' '.join(toks[:n])
+        k = norm_key(pref)
+        if k and k not in db:
+            db[k] = {"ticker": sym}
+        # +/& → "and" variant
+        kand = norm_key(k.replace('+',' and ').replace('&',' and '))
+        if kand and kand not in db:
+            db[kand] = {"ticker": sym}
 
-          tail -n +2 "$INPUT_FILE" | while IFS=$'\t' read -r sym name _; do
-            [ -n "${sym:-}" ] || continue
-            [ -n "${name:-}" ] || continue
-            name="$(printf '%s' "$name" | tr -s '[:space:]' ' ')"
-            read -r -a TOKS <<<"$name"
-            for n in 1 2 3 4; do
-              [ ${#TOKS[@]} -ge $n ] || break
-              prefix="${TOKS[*]:0:$n}"
-              key="$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g; s/^ +| +$//g')"
-              [ -n "$key" ] && printf '%s\t%s\n' "$key" "$sym" >> "$KT"
-              key_and="$(printf '%s' "$key" | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g')"
-              [ "$key_and" != "$key" ] && printf '%s\t%s\n' "$key_and" "$sym" >> "$KT"
-            done
-          done
+print(json.dumps(db, ensure_ascii=False))
+PY
 
-          jq -Rs '
-            split("\n")
-            | map(select(length>0) | split("\t") | {k:.[0], t:.[1]})
-            | reduce .[] as $r ({}; if has($r.k) then . else .[$r.k] = {ticker:$r.t} end)
-          ' "$KT" > .cache/symbol_db.json
+    echo "$NEW_HASH" > .cache/symbols.sha256
+    echo "✅ Lookup built (keys: $(jq 'keys|length' .cache/symbol_db.json))"
 
-          echo "$NEW_HASH" > .cache/symbols.sha256
-          echo "✅ Lookup built (keys: $(jq 'keys|length' .cache/symbol_db.json))"
-
-      # ---------- Build important company prefixes (from first column) ----------
-      - name: Build important companies key list
-        shell: bash
-        run: |
-          set -euo pipefail
-          IMP_FILE="data/important_companies.tsv"  # TAB-separated; col1 = Company Name (header allowed)
-          if [ ! -f "$IMP_FILE" ]; then
-            echo "ℹ️  No $IMP_FILE found. Important-company routing will be skipped."
-            echo '[]' > .cache/important_keys.json
-            echo "" > .cache/important.sha256
-            exit 0
-          fi
-
-          NEW_HASH="$(sha256sum "$IMP_FILE" | awk '{print $1}')"
-          OLD_HASH="$(cat .cache/important.sha256 || true)"
-
-          if [ "$NEW_HASH" = "$OLD_HASH" ] && [ -s .cache/important_keys.json ]; then
-            echo "🟢 important_companies.tsv unchanged; keys: $(jq 'length' .cache/important_keys.json)"
-            exit 0
-          fi
-
-          echo "🔄 Building important-company prefixes (1..4 words)…"
-          TMP=/tmp/important_keys.txt
-          : > "$TMP"
-
-          tail -n +1 "$IMP_FILE" | while IFS=$'\t' read -r cname _; do
-            [ -n "${cname:-}" ] || continue
-            if echo "$cname" | grep -Eiq '^company[[:space:]]*name$'; then
-              continue
-            fi
-            cname="$(printf '%s' "$cname" | tr -s '[:space:]' ' ')"
-            read -r -a TOKS <<<"$cname"
-            for n in 1 2 3 4; do
-              [ ${#TOKS[@]} -ge $n ] || break
-              pref="${TOKS[*]:0:$n}"
-              key="$(printf '%s' "$pref" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g; s/^ +| +$//g')"
-              [ -n "$key" ] && printf '%s\n' "$key" >> "$TMP"
-              key_and="$(printf '%s' "$key" | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g')"
-              [ "$key_and" != "$key" ] && printf '%s\n' "$key_and" >> "$TMP"
-            done
-          done
-
-          sort -u "$TMP" | jq -R . | jq -s . > .cache/important_keys.json
-          echo "$NEW_HASH" > .cache/important.sha256
-          echo "✅ Important-company keys: $(jq 'length' .cache/important_keys.json)"
-
-      # ---------- Parse feeds & post ----------
-      - name: Parse RSS feeds and post to Slack
-        env:
-          SLACK_WEBHOOK_GENERAL: ${{ secrets.SLACK_WEBHOOK_GENERAL }}
-          SLACK_WEBHOOK_MEDICAL: ${{ secrets.SLACK_WEBHOOK_MEDICAL }}
-          SLACK_WEBHOOK_CONTRACTS: ${{ secrets.SLACK_WEBHOOK_CONTRACTS }}
-          SLACK_WEBHOOK_EARNINGS: ${{ secrets.SLACK_WEBHOOK_EARNINGS }}
-          SLACK_WEBHOOK_IMP: ${{ secrets.SLACK_WEBHOOK_IMP_COMPANIES }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEBUG=${DEBUG:-0}
-
-          FEEDS=(
-            "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRXEMGSQ5SVFJUGExaFEhaUlJDFUkQUhFUUFNdGEU="
-            "https://www.globenewswire.com/rssfeed/exchange/Nasdaq,NYSE"
-            "https://www.prnewswire.com/rss/news-releases-list.rss"
-          )
-          PRN_FEED="https://www.prnewswire.com/rss/news-releases-list.rss"
-
-          declare -A WEBHOOKS=(
-            [general]="${SLACK_WEBHOOK_GENERAL}"
-            [medical]="${SLACK_WEBHOOK_MEDICAL}"
-            [contracts]="${SLACK_WEBHOOK_CONTRACTS}"
-            [earnings]="${SLACK_WEBHOOK_EARNINGS}"
-          )
-          WEBHOOK_IMP="${SLACK_WEBHOOK_IMP}"
-
-          WINDOW_SEC=600
-          CURRENT_TIME=$(date -u +%s)
-          CUTOFF=$((CURRENT_TIME - WINDOW_SEC))
-
-          NEG_CACHE=".cache/negative_prn.json"
-          is_negative_cached() { jq -e --arg k "$1" 'has($k)' "$NEG_CACHE" >/dev/null 2>&1; }
-          mark_negative() {
-            local key="$1"; tmp=$(mktemp)
-            jq --arg k "$key" --arg t "$(date -u +%FT%TZ)" \
-               '.[$k] = {last_checked:$t}' "$NEG_CACHE" > "$tmp" && mv "$tmp" "$NEG_CACHE"
-          }
-          unmark_negative() {
-            local key="$1"; tmp=$(mktemp)
-            jq --arg k "$key" 'del(.[$k])' "$NEG_CACHE" > "$tmp" && mv "$tmp" "$NEG_CACHE"
-          }
-
-          # pre-load important keys once (perf)
-          declare -a IMP_KEYS=()
-          if [ -s .cache/important_keys.json ]; then
-            mapfile -t IMP_KEYS < <(jq -r '.[]' .cache/important_keys.json)
-          fi
-
-          safe_xpath() { xmllint --xpath "string($2)" "$1" 2>/dev/null || true; }
-
-          resolve_company_local() {
-            local raw="$1" k hit
-            k="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g; s/^ +| +$//g')"
-            hit=$(jq -cr --arg k "$k" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
-            if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
-            k2="$(printf '%s' "$k" | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g')"
-            hit=$(jq -cr --arg k "$k2" 'if has($k) then .[$k] else null end' .cache/symbol_db.json)
-            if [ "$hit" != "null" ] && [ -n "$hit" ]; then echo "$hit"; return 0; fi
-            echo '{"ticker":null}'
-          }
-
-          extract_chunk_before_verb() {
-            local title="$1"
-            local pre; pre=$(echo "$title" | sed -E 's/ — / - /g' | awk -F' - |:|\\|\\|' '{print $1}')
-            [ -z "$pre" ] && pre="$title"
-            pre=$(echo "$pre" | sed 's/[“”"()™®©]//g' | tr -s ' ')
-            awk '{
-              n=NF; chunk=""
-              verbs="reports report announces announce launches launch unveils introduces reveals confirms completes signs wins awarded enters partners acquires files prices lists successfully passes secures appoints names extends expands approves approved"
-              split(verbs,V," ")
-              for(i=1;i<=n;i++){
-                wl=tolower($i); if(wl in V) break
-                if($i ~ /^[A-Z][A-Za-z0-9.+&-]*$/ || $i ~ /^[A-Z0-9-]{2,}$/){
-                  chunk = (length(chunk)?chunk" ":"") $i
-                } else if(length(chunk)>0) break
-              }
-              print chunk
-            }' <<<"$pre"
-          }
-
-          is_earnings_title() {
-            local t="$1"
-            echo "$t" | grep -Eqi \
-              '(^|[[:space:][:punct:]])(reports?|announces?) ([[:alpha:]]+ )?(first|second|third|fourth|q[1-4]) (quarter|results|earnings)|(^|[[:space:][:punct:]])fiscal [0-9]{4} (results|earnings)|(^|[[:space:][:punct:]])earnings (results|release|call)|(^|[[:space:][:punct:]])q[1-4] (results|earnings)|(^|[[:space:][:punct:]])eps([[:space:][:punct:]]|$)'
-          }
-
-          is_important_headline() {
-            local t="$1"
-            local tnorm cnorm
-            tnorm="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]' | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g; s/^ +| +$//g')"
-            cnorm="$(extract_chunk_before_verb "$t" | tr '[:upper:]' '[:lower:]' | sed 's/[+&]/ and /g' | sed -E 's/ +/ /g; s/^ +| +$//g')"
-            for key in "${IMP_KEYS[@]}"; do
-              [ -z "$key" ] && continue
-              case "$tnorm" in "$key"|"$key "*) return 0 ;; esac
-              case "$cnorm" in "$key"|"$key "*) return 0 ;; esac
-            done
-            return 1
-          }
-
-          CURL_OPTS=( -sS --fail --retry 2 --retry-all-errors --max-time 15 )
-
-          NEW_ARTICLE_FOUND=false
-
-          for FEED_URL in "${FEEDS[@]}"; do
-            XML_FILE=$(mktemp)
-            if ! curl "${CURL_OPTS[@]}" -L "$FEED_URL" > "$XML_FILE"; then
-              [ "$DEBUG" = 1 ] && echo "curl failed for $FEED_URL" >&2
-              rm -f "$XML_FILE"; continue
-            fi
-            [ -s "$XML_FILE" ] || { rm -f "$XML_FILE"; continue; }
-
-            ITEMS=$(xmllint --xpath 'count(//item | //entry)' "$XML_FILE" 2>/dev/null || echo 0)
-            ITEMS=${ITEMS%.*}
-
-            for i in $(seq 1 "$ITEMS"); do
-              LINK=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/link | (//item|//entry)[$i]/link/@href")
-              TITLE=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/title")
-              DESCRIPTION=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/description | //entry[$i]/summary")
-              PUBDATE=$(safe_xpath "$XML_FILE" "(//item|//entry)[$i]/pubDate | //entry[$i]/updated")
-              [ -z "$LINK" ] && continue
-              [ -z "$TITLE" ] && TITLE="(No Title)"
-              [ -z "$DESCRIPTION" ] && DESCRIPTION="(No summary available)"
-
-              DESCRIPTION=$(echo "$DESCRIPTION" | w3m -dump -T text/html | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//' | head -c 300)
-              CONTENT="$TITLE $DESCRIPTION"
-              CONTENT_LOWER=$(echo "$CONTENT" | tr '[:upper:]' '[:lower:]')
-
-              ARTICLE_TIME=$(date -d "$PUBDATE" +%s 2>/dev/null || echo 0)
-              if [ "$ARTICLE_TIME" -eq 0 ]; then
-                [ "$DEBUG" = 1 ] && echo "Time parse failed → skip: $TITLE" >&2
-                continue
-              fi
-              [ "$ARTICLE_TIME" -ge "$CUTOFF" ] || { [ "$DEBUG" = 1 ] && echo "Outside window: $TITLE" >&2; continue; }
-
-              HEADLINE_HASH=$(printf '%s' "$TITLE" | sha256sum | awk '{print $1}')
-              LINK_HASH=$(printf '%s' "$LINK"  | sha256sum | awk '{print $1}')
-
-              # rolling-window (title) check
-              if grep -qx "$HEADLINE_HASH" <(awk '{print $2}' .cache/last_10min_articles.txt); then
-                [ "$DEBUG" = 1 ] && echo "Dedup window(title): $TITLE" >&2
-                continue
-              fi
-
-              # global dedupe
-              if grep -qx "$LINK_HASH"    .cache/sent_link_hashes.txt;  then continue; fi
-              if grep -qx "$HEADLINE_HASH" .cache/sent_title_hashes.txt; then continue; fi
-
-              # ===== PR Newswire US-company filter (prefix 1..4) =====
-              if [ "$FEED_URL" = "$PRN_FEED" ]; then
-                matched=false
-                candidates=()
-
-                fw=$(echo "$TITLE" | awk '{print $1}')
-                candidates+=("$fw")
-
-                cand_full=$(extract_chunk_before_verb "$TITLE" | sed -E 's/^ +| +$//g' | head -n1)
-                if [ -n "$cand_full" ]; then
-                  read -r -a TOKS <<<"$cand_full"
-                  for n in 1 2 3 4; do
-                    [ ${#TOKS[@]} -ge $n ] || break
-                    candidates+=( "$(printf '%s' "${TOKS[*]:0:$n}")" )
-                  done
-                fi
-
-                for cand in "${candidates[@]}"; do
-                  norm=$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g')
-                  if is_negative_cached "$norm"; then
-                    [ "$DEBUG" = 1 ] && echo "PRN negative-cached: $cand" >&2
-                    continue
-                  fi
-                  info=$(resolve_company_local "$cand")
-                  ticker=$(jq -r '.ticker // empty' <<<"$info")
-                  if [ -n "$ticker" ]; then
-                    matched=true
-                    unmark_negative "$norm" || true
-                    break
-                  fi
-                done
-
-                if [ "$matched" = false ]; then
-                  best="${cand_full:-$fw}"
-                  key=$(printf '%s' "$best" | tr '[:upper:]' '[:lower:]' | sed -E 's/ +/ /g')
-                  mark_negative "$key"
-                  continue
-                fi
-              fi
-              # ===== end PRN filter =====
-
-              # ===== Category routing =====
-              if is_earnings_title "$TITLE" || is_earnings_title "$DESCRIPTION"; then
-                CATEGORY="earnings"
-              else
-                if echo "$CONTENT_LOWER" | grep -qE "positive topline|positive trial results|collaboration|funding"; then
-                  CATEGORY="medical"
-                elif echo "$CONTENT_LOWER" | grep -qE "contract awarded|acquisition|investment|deal|strategic partnership"; then
-                  CATEGORY="contracts"
-                else
-                  CATEGORY="general"
-                fi
-              fi
-
-              # Sentiment (naive)
-              if echo "$CONTENT_LOWER" | grep -qE "record|growth|surge|positive|expands|secured|approved|funding|investment|invests|acquire|acquired|launch|topline|announces|partnership"; then
-                SENTIMENT=":large_green_circle: [POSITIVE]"; RECOMMENDATION="BUY"
-              elif echo "$CONTENT_LOWER" | grep -qE "layoff|lawsuit|delay|loss|drop|decline|recall|fails|resigns|investigation"; then
-                SENTIMENT=":red_circle: [NEGATIVE]"; RECOMMENDATION="SELL"
-              else
-                SENTIMENT=":white_circle: [NEUTRAL]"; RECOMMENDATION="HOLD"
-              fi
-
-              PAYLOAD=$(jq -n \
-                --arg title "$TITLE" \
-                --arg desc "$DESCRIPTION" \
-                --arg link "$LINK" \
-                --arg sentiment "$SENTIMENT" \
-                --arg pubdate "${PUBDATE:-Unknown}" \
-                --arg rec "$RECOMMENDATION" \
-                '{
-                  blocks: [
-                    { "type": "section", "text": { "type": "mrkdwn", "text": ":bell: *New Article*\n\($sentiment) *\($title)*" } },
-                    { "type": "section", "text": { "type": "mrkdwn", "text": ":page_facing_up: \($desc)" } },
-                    { "type": "context", "elements": [
-                        { "type": "mrkdwn", "text": ":link: <\($link)|Read more>" },
-                        { "type": "mrkdwn", "text": ":clock3: Posted: \($pubdate)" },
-                        { "type": "mrkdwn", "text": ":mag: Suggestion: *\($rec)*" }
-                      ]
-                    }
-                  ]
-                }')
-
-              # Send to main category channel
-              curl -s -X POST "${WEBHOOKS[$CATEGORY]}" -H 'Content-type: application/json' --data "$PAYLOAD" >/dev/null || true
-
-              # ALSO send to important-companies channel if it matches (regardless of exchange)
-              if [ -n "$WEBHOOK_IMP" ] && is_important_headline "$TITLE"; then
-                curl -s -X POST "$WEBHOOK_IMP" -H 'Content-type: application/json' --data "$PAYLOAD" >/dev/null || true
-              fi
-
-              # record dedupe + rolling window entry
-              echo "$LINK_HASH"     >> .cache/sent_link_hashes.txt
-              echo "$HEADLINE_HASH" >> .cache/sent_title_hashes.txt
-              echo "$(date -u +%s) $HEADLINE_HASH" >> .cache/last_10min_articles.txt
-
-              NEW_ARTICLE_FOUND=true
-            done
-            rm -f "$XML_FILE"
-          done
-
-          if [ "$NEW_ARTICLE_FOUND" = false ]; then
-            echo "✅ No new articles in the last 10 minutes."
-          fi
-
-          exit 0
+    # Quick sanity: show a few keys
+    jq -r 'to_entries | .[0:5] | .[] | "\(.key) => \(.value.ticker)"' .cache/symbol_db.json || true
