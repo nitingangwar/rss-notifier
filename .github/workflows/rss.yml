@@ -42,11 +42,6 @@ jobs:
           [ -f .cache/important_keys.json ] || echo '[]' > .cache/important_keys.json
           [ -f .cache/important.sha256 ] || : > .cache/important.sha256
 
-      # >>> ONE-TIME REPAIR: wipe old negative matches <<
-      - name: Reset negative cache (one-time fix)
-        run: |
-          echo '{}' > .cache/negative_prn.json
-      # ^ Remove this whole step after the first successful run.
 
       # Build ticker lookup from your TAB-separated data/symbols.csv (1–4 word prefixes)
       - name: Build symbol lookup (rebuild only if TSV changed)
